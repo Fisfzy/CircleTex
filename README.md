@@ -1,0 +1,2 @@
+# CircleTex
+一个基于vscode平台，依托于AGENT，可以实现圈选内容即时修改的latex辅助写作插件
