@@ -1,0 +1,197 @@
+{
+  "name": "circletex",
+  "displayName": "CircleTeX",
+  "description": "在 PDF 审阅界面中用键盘直接增删改 LaTeX 正文，或调用 AI 助手生成受控修订。",
+  "version": "0.7.3",
+  "publisher": "local",
+  "license": "SEE LICENSE IN LICENSE.txt",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other",
+    "Visualization"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    },
+    "virtualWorkspaces": false
+  },
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:circletex.start",
+    "onView:circletex.settings",
+    "onCommand:circletex.openPdfReview",
+    "onCommand:circletex.configureProject",
+    "onCommand:circletex.compileDocument",
+    "onCommand:circletex.selectAssistant",
+    "onCommand:circletex.selectManualEditMode",
+    "onCommand:circletex.showOutput"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "circletex.openPdfReview",
+        "title": "CircleTeX：打开 PDF 审阅"
+      },
+      {
+        "command": "circletex.configureProject",
+        "title": "CircleTeX：选择论文项目目录"
+      },
+      {
+        "command": "circletex.compileDocument",
+        "title": "CircleTeX：编译论文"
+      },
+      {
+        "command": "circletex.selectAssistant",
+        "title": "CircleTeX：选择 AI 助手"
+      },
+      {
+        "command": "circletex.selectManualEditMode",
+        "title": "CircleTeX：选择 PDF 编辑模式"
+      },
+      {
+        "command": "circletex.showOutput",
+        "title": "CircleTeX：查看编译日志"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "circletex",
+          "title": "CircleTeX",
+          "icon": "media/circletex-activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "circletex": [
+        {
+          "id": "circletex.start",
+          "name": "论文审阅"
+        },
+        {
+          "id": "circletex.settings",
+          "name": "设置"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "circletex.openPdfReview",
+          "when": "view == circletex.start",
+          "group": "navigation@1"
+        },
+        {
+          "command": "circletex.compileDocument",
+          "when": "view == circletex.start",
+          "group": "navigation@2"
+        },
+        {
+          "command": "circletex.configureProject",
+          "when": "view == circletex.start",
+          "group": "navigation@3"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "CircleTeX",
+      "properties": {
+        "circletex.projectRoot": {
+          "type": "string",
+          "default": "",
+          "description": "包含 main.tex 和 main.pdf 的论文项目目录。留空时自动查找。",
+          "scope": "resource"
+        },
+        "circletex.codexCommand": {
+          "type": "string",
+          "default": "codex",
+          "description": "Codex CLI 可执行文件名或绝对路径。",
+          "scope": "machine"
+        },
+        "circletex.aiAssistant": {
+          "type": "string",
+          "enum": [
+            "codex",
+            "snow"
+          ],
+          "enumDescriptions": [
+            "使用 Codex CLI 的只读结构化分析。",
+            "使用 Snow CLI 的隔离 ACP 文本分析。"
+          ],
+          "default": "codex",
+          "description": "CircleTeX 生成局部修订建议时使用的 AI 助手。",
+          "scope": "machine"
+        },
+        "circletex.manualEditMode": {
+          "type": "string",
+          "enum": [
+            "direct",
+            "tracked"
+          ],
+          "enumDescriptions": [
+            "直接修改 LaTeX 正文；待提交标记仅用于预览，编译后的 PDF 不保留红色或删除线。",
+            "使用 CircleTeX 修订宏保留红色新增和删除线，随后可接受或拒绝全部修订。"
+          ],
+          "default": "direct",
+          "description": "PDF 手动编辑写入 main.tex 时使用的模式。",
+          "scope": "resource"
+        },
+        "circletex.snowCommand": {
+          "type": "string",
+          "default": "snow",
+          "description": "Snow CLI 可执行文件名或绝对路径。",
+          "scope": "machine"
+        },
+        "circletex.autoCompile": {
+          "type": "boolean",
+          "default": true,
+          "description": "应用修改后自动执行预检与 XeLaTeX 编译。",
+          "scope": "resource"
+        },
+        "circletex.compilePasses": {
+          "type": "integer",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 4,
+          "description": "每次编译允许执行的 XeLaTeX 最大遍数；默认两遍，辅助文件稳定且日志无重跑要求时可安全提前结束。",
+          "scope": "resource"
+        },
+        "circletex.contextLines": {
+          "type": "integer",
+          "default": 20,
+          "minimum": 5,
+          "maximum": 80,
+          "description": "提交给 AI 助手的选区前后上下文行数。",
+          "scope": "resource"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "copy:assets": "node ./scripts/copy-pdfjs.mjs",
+    "compile": "npm run copy:assets && tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "check:webview": "node --check media/viewer.js",
+    "test:unit": "node --test out/test/applyRange.test.js out/test/assistantTypes.test.js out/test/codex.test.js out/test/compilerTransaction.test.js out/test/manualEdits.test.js out/test/processRunner.test.js out/test/selectionPayload.test.js out/test/snow.test.js out/test/synctex.test.js out/test/synctexParser.test.js",
+    "test:manual-tex": "node scripts/smoke-manual-tex.mjs",
+    "test:viewer": "node scripts/smoke-viewer.mjs",
+    "test": "npm run compile && npm run check:webview && npm run test:unit && npm run test:manual-tex && npm run test:viewer",
+    "package": "vsce package --no-dependencies --allow-missing-repository",
+    "vscode:prepublish": "npm test"
+  },
+  "devDependencies": {
+    "@types/node": "20.16.1",
+    "@types/vscode": "1.95.0",
+    "@vscode/vsce": "^3.7.1",
+    "pdfjs-dist": "^5.4.624",
+    "playwright-core": "^1.55.0",
+    "typescript": "^5.7.2"
+  }
+}

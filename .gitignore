@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Build output
+out/
+
+# VSIX packages
+*.vsix
+
+# Internal artifacts
+artifacts/
+
+# IDE / editor
+.vscode/
+
+# Snow / agent runtime
+.snow/
+
+# OS junk
+Thumbs.db
+Desktop.ini
