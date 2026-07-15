@@ -10,9 +10,9 @@ circletex-0.3.*.vsix
 circletex-0.4.*.vsix
 circletex-0.5.*.vsix
 circletex-0.6.*.vsix
-circletex-0.7.0.vsix
-circletex-0.7.1.vsix
-circletex-0.7.2.vsix
+circletex-0.7.*.vsix
+circletex-0.8.*.vsix
+circletex-0.9.0.vsix
 
 # Internal artifacts
 artifacts/

@@ -5,12 +5,29 @@ import { isFile } from "./fsUtils";
 import { hashNormalizedText } from "./applyRange";
 import { findExecutable, runProcess } from "./processRunner";
 import { hasTextualOverlap } from "./selectionMatcher";
+import type { ImageEditCandidate } from "./imageEditResolver";
 import type { ManualEditSourceRange } from "./manualEdits";
 import { parseSyncTexOutput, parseSyncTexViewOutput } from "./synctexParser";
 import { computeLineStarts } from "./textRange";
-import { PdfPoint, PdfSelection, ProjectPaths, SourceMapping, SyncTexRecord } from "./types";
+import { ImagePdfSelection, PdfPoint, PdfSelection, ProjectPaths, SourceMapping, SyncTexRecord } from "./types";
 
 export class SyncTexLocator {
+  public async mapImageSelection(
+    project: ProjectPaths,
+    selection: ImagePdfSelection
+  ): Promise<SyncTexRecord[]> {
+    const executable = await this.requireCurrentArtifacts(project);
+    const records = await mapWithConcurrency(selection.anchors.map((point) => ({ page: selection.page, point })), 4, (location) =>
+      this.locatePoint(executable, project, location.page, location.point)
+    );
+    const mainPath = normalizePath(project.tex, project.root);
+    const mainRecords = records.filter((record) => normalizePath(record.input, project.root) === mainPath);
+    if (mainRecords.length < Math.ceil(selection.anchors.length * 0.6)) {
+      throw new Error("图片区域的大部分定位点没有映射到 main.tex，请缩小选框并避开图注或相邻子图。");
+    }
+    return mainRecords;
+  }
+
   public async mapSelection(
     project: ProjectPaths,
     selection: PdfSelection,
@@ -34,11 +51,9 @@ export class SyncTexLocator {
       throw new Error("未找到 synctex 命令。请检查 TeX 发行版安装。");
     }
 
-    const points = selection.kind === "region"
-      ? uniquePoints([selection.start, ...selection.anchors, selection.end])
-      : uniquePoints([selection.start, selection.end]);
-    const records = await mapWithConcurrency(points, 4, (point) =>
-      this.locatePoint(executable, project, selection.page, point)
+    const locations = selectionLocations(selection);
+    const records = await mapWithConcurrency(locations, 4, (location) =>
+      this.locatePoint(executable, project, location.page, location.point)
     );
     const mainPath = normalizePath(project.tex, project.root);
     if (records.some((record) => normalizePath(record.input, project.root) !== mainPath)) {
@@ -46,10 +61,10 @@ export class SyncTexLocator {
     }
     const mappedLines = records.map((record) => record.line);
     if (
-      selection.kind === "region" &&
+      (selection.kind === "region" || (selection.kind === "text" && (selection.pageFragments?.length ?? 0) > 1)) &&
       !hasMonotonicSourceOrder(mappedLines)
     ) {
-      throw new Error("区域内文字未形成连续的源码顺序，请缩小框选范围。");
+      throw new Error("PDF 选区未形成连续递增的源码顺序，请缩小或重新选择范围。");
     }
     const startLine = Math.min(...mappedLines);
     const endLine = Math.max(...mappedLines);
@@ -59,10 +74,15 @@ export class SyncTexLocator {
     const mapping = await buildSourceMapping(project.tex, selection, startLine, endLine, contextLines);
     const hasOverlap = hasTextualOverlap(selection.text, mapping.sourceText);
     if (selection.kind === "region") {
-      mapping.confidenceNote = hasOverlap
-        ? "区域框选已通过多点定位，请核对连续源码范围后再分析。"
-        : "区域文字与映射源码未形成稳定文本匹配，请手动调整并确认范围。";
-      mapping.requiresConfirmation = true;
+      const directEdit = selection.interactionMode === "direct";
+      mapping.confidenceNote = directEdit
+        ? hasOverlap
+          ? "区域框选已通过多点定位，提交时将再次校验连续且安全的源码范围。"
+          : "区域文字与映射源码匹配较弱，提交时将执行严格校验并在不唯一时拒绝修改。"
+        : hasOverlap
+          ? "区域框选已通过多点定位，请核对连续源码范围后再分析。"
+          : "区域文字与映射源码未形成稳定文本匹配，请手动调整并确认范围。";
+      mapping.requiresConfirmation = !directEdit;
     } else if (!hasOverlap) {
       mapping.confidenceNote = "PDF 文字与映射源码未形成稳定文本匹配，请重点核对或手动调整行范围。";
       mapping.requiresConfirmation = true;
@@ -75,7 +95,7 @@ export class SyncTexLocator {
     mapping: SourceMapping,
     candidates: readonly ManualEditSourceRange[]
   ): Promise<ManualEditSourceRange> {
-    if (mapping.selection.kind !== "text" || candidates.length < 2) {
+    if (candidates.length < 2) {
       throw new Error("重复片段缺少可用于 PDF 位置消歧的数据。");
     }
     const executable = await findExecutable("synctex");
@@ -102,6 +122,109 @@ export class SyncTexLocator {
     return candidates[chosenIndex];
   }
 
+  public async disambiguateCaretOffset(
+    project: ProjectPaths,
+    mapping: SourceMapping,
+    candidates: readonly number[]
+  ): Promise<number> {
+    const target = mapping.selection.kind === "text" ? mapping.selection.caretPoint : undefined;
+    if (!target || candidates.length < 2) {
+      throw new Error("光标边界缺少可用于 PDF 空间消歧的数据。");
+    }
+    const executable = await findExecutable("synctex");
+    if (!executable) {
+      throw new Error("未找到 synctex 命令，无法区分多个光标源码边界。");
+    }
+    const positions = candidates.map((candidate) => sourceLineColumn(mapping, candidate));
+    const outputs = await mapWithConcurrency(positions, 2, async (position) => {
+      const input = `${position.line}:${position.column}:${project.tex}`;
+      const result = await runProcess(executable, ["view", "-i", input, "-o", project.pdf], {
+        cwd: project.root,
+        timeoutMs: 15_000
+      });
+      if (result.code !== 0) return [];
+      return parseSyncTexViewOutput(result.stdout).filter((record) => record.page === mapping.selection.page);
+    });
+    const chosenIndex = chooseSyncTexSpatialCandidate(outputs, target);
+    if (chosenIndex === undefined) {
+      throw new Error("公式或引用附近存在多个源码边界，且 PDF 位置仍无法唯一确认。请单击结构另一侧或拖选普通文字替换。");
+    }
+    return candidates[chosenIndex];
+  }
+
+  public async disambiguateImageCandidate(
+    project: ProjectPaths,
+    candidates: readonly ImageEditCandidate[],
+    selection: ImagePdfSelection
+  ): Promise<ImageEditCandidate> {
+    if (candidates.length < 2) {
+      throw new Error("图片候选不足，无法执行空间消歧。");
+    }
+    const executable = await findExecutable("synctex");
+    if (!executable) {
+      throw new Error("未找到 synctex 命令，无法区分相邻图片。");
+    }
+    const outputs = await mapWithConcurrency([...candidates], 2, async (candidate) => {
+      const input = `${candidate.commandLine}:1:${project.tex}`;
+      const result = await runProcess(executable, ["view", "-i", input, "-o", project.pdf], {
+        cwd: project.root,
+        timeoutMs: 15_000
+      });
+      if (result.code !== 0) return [];
+      return parseSyncTexViewOutput(result.stdout).filter((record) => record.page === selection.page);
+    });
+    const target = {
+      x: selection.bounds.x + selection.bounds.width / 2,
+      y: selection.bounds.y + selection.bounds.height / 2
+    };
+    const chosenIndex = chooseSyncTexSpatialCandidate(outputs, target);
+    if (chosenIndex === undefined) {
+      throw new Error("框选区域对应多个图片命令，SyncTeX 仍无法唯一确认。请缩小选框，只覆盖一张图片主体。");
+    }
+    return candidates[chosenIndex];
+  }
+
+  public async locateImageCandidateViews(
+    project: ProjectPaths,
+    candidate: ImageEditCandidate,
+    page: number
+  ): Promise<import("./types").SyncTexViewRecord[]> {
+    const executable = await findExecutable("synctex");
+    if (!executable) {
+      throw new Error("未找到 synctex 命令，无法复核图片边界。");
+    }
+    const input = `${candidate.commandLine}:1:${project.tex}`;
+    const result = await runProcess(executable, ["view", "-i", input, "-o", project.pdf], {
+      cwd: project.root,
+      timeoutMs: 15_000
+    });
+    if (result.code !== 0) {
+      throw new Error(`SyncTeX 图片正向定位失败：${(result.stderr || result.stdout).trim()}`);
+    }
+    return parseSyncTexViewOutput(result.stdout).filter((record) => record.page === page);
+  }
+
+  private async requireCurrentArtifacts(project: ProjectPaths): Promise<string> {
+    if (!(await isFile(project.syncTex)) || !(await isFile(project.pdf))) {
+      throw new Error("缺少 main.synctex.gz。请先使用 CircleTeX 编译论文。");
+    }
+    const [texStat, pdfStat, syncStat] = await Promise.all([
+      fs.stat(project.tex), fs.stat(project.pdf), fs.stat(project.syncTex)
+    ]);
+    if (
+      pdfStat.mtimeMs + 1_000 < texStat.mtimeMs ||
+      syncStat.mtimeMs + 1_000 < texStat.mtimeMs ||
+      syncStat.mtimeMs + 1_000 < pdfStat.mtimeMs
+    ) {
+      throw new Error("SyncTeX 定位信息已过期，请先重新编译论文。");
+    }
+    const executable = await findExecutable("synctex");
+    if (!executable) {
+      throw new Error("未找到 synctex 命令。请检查 TeX 发行版安装。");
+    }
+    return executable;
+  }
+
   private async locatePoint(
     executable: string,
     project: ProjectPaths,
@@ -123,6 +246,34 @@ export class SyncTexLocator {
     }
     return best;
   }
+}
+
+export function selectionLocations(selection: PdfSelection): Array<{ page: number; point: PdfPoint }> {
+  if (selection.kind === "region") {
+    return uniqueLocations([selection.start, ...selection.anchors, selection.end].map((point) => ({
+      page: selection.page,
+      point
+    })));
+  }
+  if (selection.pageFragments?.length) {
+    return uniqueLocations(selection.pageFragments.flatMap((fragment) => [
+      { page: fragment.page, point: fragment.start },
+      { page: fragment.page, point: fragment.end }
+    ]));
+  }
+  return uniqueLocations([selection.start, selection.end].map((point) => ({ page: selection.page, point })));
+}
+
+function uniqueLocations(
+  locations: readonly { page: number; point: PdfPoint }[]
+): Array<{ page: number; point: PdfPoint }> {
+  const seen = new Set<string>();
+  return locations.filter(({ page, point }) => {
+    const key = `${page}:${point.x.toFixed(3)}:${point.y.toFixed(3)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function sourceLineColumn(mapping: SourceMapping, absoluteOffset: number): { line: number; column: number } {

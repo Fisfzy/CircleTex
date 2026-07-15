@@ -13,12 +13,23 @@ interface BasePdfSelection {
   page: number;
   start: PdfPoint;
   end: PdfPoint;
+  interactionMode?: "direct" | "agent";
+  interactionVersion?: number;
 }
 
 export interface TextPdfSelection extends BasePdfSelection {
   kind: "text";
+  pageFragments?: TextPdfPageFragment[];
   contextBefore?: string;
   contextAfter?: string;
+  caretPoint?: PdfPoint;
+}
+
+export interface TextPdfPageFragment {
+  page: number;
+  text: string;
+  start: PdfPoint;
+  end: PdfPoint;
 }
 
 export interface SyncTexViewRecord {
@@ -31,13 +42,33 @@ export interface SyncTexViewRecord {
   height?: number;
 }
 
+export interface RegionTextFragment {
+  text: string;
+  start: PdfPoint;
+  end: PdfPoint;
+  rects: PdfRect[];
+  lineIndex: number;
+}
+
 export interface RegionPdfSelection extends BasePdfSelection {
   kind: "region";
   bounds: PdfRect;
   anchors: PdfPoint[];
+  fragments: RegionTextFragment[];
 }
 
 export type PdfSelection = TextPdfSelection | RegionPdfSelection;
+
+export interface ImagePdfSelection {
+  page: number;
+  bounds: PdfRect;
+  roughBounds: PdfRect;
+  imageObjectName: string;
+  anchors: PdfPoint[];
+  pageWidth: number;
+  pageHeight: number;
+  interactionVersion?: number;
+}
 
 export interface ProjectPaths {
   root: string;

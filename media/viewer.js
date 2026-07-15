@@ -1,7 +1,9 @@
 const vscode = acquireVsCodeApi();
 const config = JSON.parse(document.getElementById("circletex-config").textContent);
-const pdfjs = await import(config.pdfJsUri);
-pdfjs.GlobalWorkerOptions.workerSrc = config.workerUri;
+let activePdfFingerprint = config.pdfFingerprint;
+let activePreviewKey = config.previewKey;
+const pdfJsPromise = import(config.pdfJsUri);
+const persisted = vscode.getState() ?? {};
 
 const elements = {
   viewer: document.getElementById("viewer"),
@@ -41,6 +43,8 @@ const elements = {
   openSource: document.getElementById("open-source"),
   confirmRange: document.getElementById("confirm-range"),
   confidenceNote: document.getElementById("confidence-note"),
+  taskMode: document.getElementById("task-mode"),
+  taskScopeNote: document.getElementById("task-scope-note"),
   instruction: document.getElementById("instruction"),
   analyze: document.getElementById("analyze"),
   manualHandoff: document.getElementById("manual-handoff"),
@@ -54,21 +58,52 @@ const elements = {
   compileProgressValue: document.getElementById("compile-progress-value"),
   compileProgressTrack: document.getElementById("compile-progress-track"),
   compileProgressFill: document.getElementById("compile-progress-fill"),
+  skillArtifacts: document.getElementById("skill-artifacts"),
+  promptBar: document.querySelector(".prompt-bar"),
   status: document.getElementById("status")
 };
+const immediateStartupPreview = showImmediateStartupPreview();
+const pdfjs = await pdfJsPromise;
+pdfjs.GlobalWorkerOptions.workerSrc = config.workerUri;
+if (Number.isFinite(config.extensionCreatedAt)) {
+  vscode.postMessage({
+    type: "performance",
+    label: "PDF Webview 启动",
+    durationMs: Math.max(0, Date.now() - config.extensionCreatedAt)
+  });
+}
+
+const interactionModeSwitch = document.createElement("div");
+interactionModeSwitch.id = "interaction-mode";
+interactionModeSwitch.className = "interaction-mode-switch";
+interactionModeSwitch.setAttribute("role", "group");
+interactionModeSwitch.setAttribute("aria-label", "选择处理方式");
+const modeDirectButton = document.createElement("button");
+modeDirectButton.id = "mode-direct";
+modeDirectButton.type = "button";
+modeDirectButton.textContent = "直编";
+modeDirectButton.title = "直接编辑";
+modeDirectButton.setAttribute("aria-pressed", "false");
+const modeAgentButton = document.createElement("button");
+modeAgentButton.id = "mode-agent";
+modeAgentButton.type = "button";
+modeAgentButton.textContent = "Agent";
+modeAgentButton.title = "交给 Agent 处理";
+modeAgentButton.setAttribute("aria-pressed", "false");
+interactionModeSwitch.append(modeDirectButton, modeAgentButton);
 
 const directEditButton = document.createElement("button");
 directEditButton.id = "direct-edit";
 directEditButton.className = "icon-button tool-toggle";
 directEditButton.type = "button";
-directEditButton.title = "直接编辑";
-directEditButton.setAttribute("aria-label", "直接编辑 PDF 文字");
+directEditButton.title = "文字或光标选择";
+directEditButton.setAttribute("aria-label", "文字或光标选择");
 directEditButton.setAttribute("aria-pressed", "false");
 const directEditIcon = document.createElement("span");
 directEditIcon.className = "direct-edit-icon";
 directEditIcon.setAttribute("aria-hidden", "true");
 directEditButton.append(directEditIcon);
-elements.regionSelect.before(directEditButton);
+elements.regionSelect.before(interactionModeSwitch, directEditButton);
 
 const directEditInput = document.createElement("textarea");
 directEditInput.id = "direct-edit-input";
@@ -79,6 +114,8 @@ directEditInput.hidden = true;
 directEditInput.setAttribute("aria-label", "PDF 直接编辑输入");
 document.body.append(directEditInput);
 elements.directEdit = directEditButton;
+elements.modeDirect = modeDirectButton;
+elements.modeAgent = modeAgentButton;
 elements.directInput = directEditInput;
 
 const showManualEditsDiffButton = document.createElement("button");
@@ -90,22 +127,25 @@ showManualEditsDiffButton.disabled = true;
 elements.manualClear.after(showManualEditsDiffButton);
 elements.showManualEditsDiff = showManualEditsDiffButton;
 
-const persisted = vscode.getState() ?? {};
+const initialPageNumber = positivePage(persisted.pageNumber) || positivePage(config.preview?.page) || 1;
 const state = {
   document: undefined,
   pageStates: [],
   loadGeneration: 0,
   scale: clamp(Number(persisted.scale) || 1.25, 0.45, 3),
   fitMode: persisted.fitMode !== false,
-  currentPage: positivePage(persisted.pageNumber) || 1,
+  currentPage: initialPageNumber,
   renderQueue: [],
   queuedPages: new Set(),
   desiredPages: new Set(),
   activeRenders: 0,
   observer: undefined,
   selectedPage: undefined,
-  selectionTool: persisted.directEditEnabled === true ? "text" : persisted.selectionTool === "region" ? "region" : "text",
-  directEditEnabled: persisted.directEditEnabled === true,
+  selectedPages: new Set(),
+  textSelectionDrag: undefined,
+  selectionTool: ["none", "text", "region"].includes(persisted.selectionTool) ? persisted.selectionTool : "text",
+  interactionMode: persisted.interactionMode === "direct" || persisted.directEditEnabled === true ? "direct" : "agent",
+  interactionVersion: 0,
   directDraft: undefined,
   directCaptureSpec: undefined,
   directIgnoreNextSelectionCapture: false,
@@ -115,6 +155,9 @@ const state = {
   textSelection: undefined,
   regionDraft: undefined,
   regionSelection: undefined,
+  imageEditDraft: undefined,
+  imageLocateRequestId: undefined,
+  imageQueueRequestId: undefined,
   sessionId: undefined,
   mappingId: undefined,
   candidateId: undefined,
@@ -135,6 +178,9 @@ const state = {
   manualEditMode: config.manualEditMode === "tracked" ? "tracked" : "direct",
   hasTrackedRevisions: false,
   assistantName: "AI 助手",
+  skills: [],
+  selectedTask: "revision",
+  skillTaskRunning: false,
   scrollFrame: 0,
   saveTimer: undefined,
   resizeTimer: undefined,
@@ -145,8 +191,27 @@ const state = {
   pdfRefreshInProgress: false,
   compileProgressActive: false,
   compileProgressPercent: 0,
-  compileProgressHideTimer: undefined
+  compileProgressHideTimer: undefined,
+  cachedPreviewSignature: undefined,
+  startupPreview: undefined,
+  cachedPreviewPage: undefined,
+  previewCacheTimer: undefined,
+  primaryRenderPending: false
 };
+
+function showImmediateStartupPreview() {
+  const preview = config.preview;
+  const savedPage = positivePage(persisted.pageNumber);
+  if (!preview || typeof preview.uri !== "string" || (savedPage && savedPage !== preview.page)) return undefined;
+  const overlay = document.createElement("div");
+  overlay.className = "startup-preview-overlay";
+  const image = document.createElement("img");
+  image.src = preview.uri;
+  image.alt = `第 ${preview.page} 页缓存预览`;
+  overlay.append(image);
+  elements.viewer.append(overlay);
+  return overlay;
+}
 
 async function loadPdf({ preservePosition = true } = {}) {
   state.pdfRefreshInProgress = true;
@@ -180,6 +245,7 @@ async function loadPdfCore({ preservePosition = true } = {}) {
   }
   const data = new Uint8Array(await response.arrayBuffer());
   reportPerformance("PDF 文件读取", readStartedAt);
+  const workerStartedAt = performance.now();
   const loadingTask = pdfjs.getDocument({
     data,
     cMapUrl: config.cMapUri,
@@ -187,18 +253,15 @@ async function loadPdfCore({ preservePosition = true } = {}) {
     standardFontDataUrl: config.standardFontsUri
   });
   const nextDocument = await loadingTask.promise;
-  const metadataStartedAt = performance.now();
-  if (state.compileProgressActive) {
-    updateCompileProgress({ percent: 96, message: "正在扫描 PDF 页面", indeterminate: true });
-  }
-  let metadata;
+  reportPerformance("PDF Worker 解析", workerStartedAt);
+  const restorePageNumber = clamp(restore.pageNumber, 1, nextDocument.numPages);
+  let preferredMetadata;
   try {
-    metadata = await readPageMetadata(nextDocument, restore.pageNumber);
+    preferredMetadata = await readSinglePageMetadata(nextDocument, restorePageNumber);
   } catch (error) {
     await nextDocument.destroy();
     throw error;
   }
-  reportPerformance("PDF 页面元数据扫描", metadataStartedAt);
 
   const oldDocument = state.document;
   const refreshSnapshot = capturePageSnapshot(restore.pageNumber);
@@ -219,31 +282,87 @@ async function loadPdfCore({ preservePosition = true } = {}) {
   }
 
   state.fitMode = restore.fitMode !== false;
-  state.scale = state.fitMode ? computeFitScale(metadata) : clamp(restore.scale, 0.45, 3);
-  buildPageShells(metadata, false);
+  state.scale = state.fitMode ? computeFitScale([preferredMetadata]) : clamp(restore.scale, 0.45, 3);
+  const initialMetadata = Array.from({ length: nextDocument.numPages }, (_, index) => ({
+    ...preferredMetadata,
+    number: index + 1
+  }));
+  const shellsStartedAt = performance.now();
+  buildPageShells(initialMetadata, false);
   elements.pageCount.textContent = `/ ${nextDocument.numPages}`;
   elements.pageNumber.max = String(nextDocument.numPages);
   elements.zoomValue.textContent = `${Math.round(state.scale * 100)}%`;
-  const restorePageNumber = clamp(restore.pageNumber, 1, nextDocument.numPages);
   state.currentPage = restorePageNumber;
   attachPageSnapshot(refreshSnapshot, state.pageStates[restorePageNumber - 1]);
+  attachStartupPreview(state.pageStates[restorePageNumber - 1]);
   await nextFrame();
   await nextFrame();
   restoreViewState({ ...restore, pageNumber: restorePageNumber });
+  immediateStartupPreview?.remove();
+  reportPerformance("PDF 首屏页面壳体", shellsStartedAt);
   state.desiredPages = new Set([restorePageNumber]);
-  const primaryRenderStartedAt = performance.now();
-  if (state.compileProgressActive) {
-    updateCompileProgress({ percent: 98, message: "正在渲染当前页", indeterminate: true });
+  const generation = state.loadGeneration;
+  const primaryRecord = state.pageStates[restorePageNumber - 1];
+  primaryRecord.status = "previewing";
+  let previewPromise = Promise.resolve();
+  if (!refreshSnapshot && !state.startupPreview) {
+    const previewStartedAt = performance.now();
+    previewPromise = renderLowResolutionPreview(primaryRecord).then(() => {
+      if (state.loadGeneration === generation) reportPerformance("PDF 首屏低清预览", previewStartedAt);
+    });
   }
-  await renderPageRecord(state.pageStates[restorePageNumber - 1]);
-  reportPerformance("PDF 当前页渲染", primaryRenderStartedAt);
+  hideLoading();
+  setStatus("PDF 页面已显示，正在准备清晰页面与文字选择……", "busy");
+  state.pdfRefreshInProgress = false;
+  if (state.compileProgressActive) {
+    updateCompileProgress({ percent: 98, message: "正在后台补齐清晰页面与文字选择", indeterminate: true });
+  }
   for (const record of state.pageStates) {
     state.observer.observe(record.shell);
   }
-  hideLoading();
+  state.primaryRenderPending = true;
+  void (async () => {
+    try {
+      await previewPromise.catch((error) => console.error(error));
+      if (state.loadGeneration !== generation) return;
+      if (state.currentPage !== restorePageNumber) {
+        primaryRecord.status = "idle";
+        return;
+      }
+      const primaryRenderStartedAt = performance.now();
+      await renderPageRecord(primaryRecord, { primary: true });
+      if (state.loadGeneration !== generation) return;
+      reportPerformance("PDF 当前页渲染", primaryRenderStartedAt);
+      reportPerformance("PDF 刷新总计", loadStartedAt);
+    } finally {
+      if (state.loadGeneration === generation) {
+        state.primaryRenderPending = false;
+        updateVisiblePages();
+      }
+    }
+  })();
+  const metadataStartedAt = performance.now();
+  void readPageMetadata(nextDocument, restorePageNumber).then((metadata) => {
+    if (state.loadGeneration !== generation) return;
+    applyPageMetadata(metadata);
+    reportPerformance("PDF 页面元数据扫描", metadataStartedAt);
+  }, (error) => console.error(error));
   updateVisiblePages();
-  reportPerformance("PDF 刷新总计", loadStartedAt);
-  setStatus("PDF 已就绪。", "ready");
+}
+
+async function readSinglePageMetadata(documentProxy, pageNumber) {
+  const page = await documentProxy.getPage(pageNumber);
+  try {
+    const viewport = page.getViewport({ scale: 1 });
+    return {
+      number: pageNumber,
+      widthPt: viewport.width,
+      heightPt: viewport.height,
+      rotation: ((page.rotate % 360) + 360) % 360
+    };
+  } finally {
+    page.cleanup();
+  }
 }
 
 async function readPageMetadata(documentProxy, preferredPage) {
@@ -314,6 +433,51 @@ function attachPageSnapshot(canvas, record) {
   record.shell.append(snapshot);
 }
 
+function attachStartupPreview(record) {
+  const preview = config.preview;
+  if (
+    !record || !preview || preview.page !== record.number ||
+    typeof preview.uri !== "string" || !Number.isFinite(preview.widthPt) || !Number.isFinite(preview.heightPt)
+  ) return;
+  record.widthPt = preview.widthPt;
+  record.heightPt = preview.heightPt;
+  updateShellSize(record);
+  const snapshot = document.createElement("div");
+  snapshot.className = "page-refresh-snapshot startup-preview";
+  const image = document.createElement("img");
+  image.src = preview.uri;
+  image.alt = `第 ${record.number} 页缓存预览`;
+  snapshot.append(image);
+  record.shell.append(snapshot);
+  state.startupPreview = snapshot;
+}
+
+async function renderLowResolutionPreview(record) {
+  if (!record || record.shell.querySelector(":scope > .page-refresh-snapshot")) return;
+  const documentProxy = state.document;
+  const generation = state.loadGeneration;
+  const page = await documentProxy.getPage(record.number);
+  try {
+    const viewport = page.getViewport({ scale: Math.min(state.scale, 0.55) });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.floor(viewport.width));
+    canvas.height = Math.max(1, Math.floor(viewport.height));
+    const context = canvas.getContext("2d", { alpha: false });
+    if (!context) return;
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: context, viewport }).promise;
+    if (state.loadGeneration !== generation || state.currentPage !== record.number) return;
+    const snapshot = document.createElement("div");
+    snapshot.className = "page-refresh-snapshot low-resolution-preview";
+    snapshot.append(canvas);
+    record.shell.append(snapshot);
+    state.startupPreview = snapshot;
+  } finally {
+    page.cleanup();
+  }
+}
+
 function reportPerformance(label, startedAt) {
   const durationMs = Math.max(0, performance.now() - startedAt);
   post("performance", { label, durationMs });
@@ -346,6 +510,7 @@ function buildPageShells(metadata, observe = true) {
       pageProxy: undefined,
       renderTask: undefined,
       textLayer: undefined,
+      imageBoundaries: [],
       renderGeneration: 0,
       renderedScale: undefined,
       status: "idle",
@@ -373,6 +538,7 @@ function updateShellSize(record) {
   renderRegionSelection(record);
   renderManualEditOverlay(record);
   renderDirectDraft(record);
+  if (state.imageEditDraft?.page === record.number) renderImageEditDraft();
 }
 
 function scheduleVisibleUpdate() {
@@ -403,17 +569,23 @@ function updateVisiblePages() {
     }
   }
   state.currentPage = bestPage;
+  if (state.cachedPreviewPage !== bestPage) {
+    clearTimeout(state.previewCacheTimer);
+    state.previewCacheTimer = setTimeout(() => {
+      const record = state.pageStates[bestPage - 1];
+      if (state.currentPage === bestPage && record?.canvas) schedulePreviewCache(record);
+    }, 900);
+  }
   if (!state.pageInputFocused) {
     elements.pageNumber.value = String(bestPage);
   }
   elements.previousPage.disabled = bestPage <= 1;
   elements.nextPage.disabled = bestPage >= state.pageStates.length;
 
-  const budget = state.scale > 2.1 ? 3 : 5;
+  const budget = state.primaryRenderPending ? 1 : state.scale > 2.1 ? 3 : 5;
   const desired = new Set();
-  if (state.selectedPage) {
-    desired.add(state.selectedPage);
-  }
+  for (const pageNumber of state.selectedPages) desired.add(pageNumber);
+  if (state.selectedPage) desired.add(state.selectedPage);
   const offsets = [0, -1, 1, -2, 2, -3, 3];
   for (const offset of offsets) {
     const pageNumber = bestPage + offset;
@@ -426,7 +598,7 @@ function updateVisiblePages() {
     enqueuePage(state.pageStates[pageNumber - 1]);
   }
   for (const record of state.pageStates) {
-    if (!desired.has(record.number) && (record.status === "rendered" || record.status === "rendering")) {
+    if (!desired.has(record.number) && ["canvas", "rendered", "rendering"].includes(record.status)) {
       releasePage(record);
     }
   }
@@ -441,10 +613,10 @@ function enqueuePage(record) {
   if (!record || state.queuedPages.has(record.number)) {
     return;
   }
-  if (record.status === "rendered" && record.renderedScale === state.scale) {
+  if (["canvas", "rendered"].includes(record.status) && record.renderedScale === state.scale) {
     return;
   }
-  if (record.status === "rendering") {
+  if (record.status === "previewing" || record.status === "rendering") {
     return;
   }
   state.queuedPages.add(record.number);
@@ -466,7 +638,7 @@ function pumpRenderQueue() {
   }
 }
 
-async function renderPageRecord(record) {
+async function renderPageRecord(record, { primary = false } = {}) {
   const documentProxy = state.document;
   const documentGeneration = state.loadGeneration;
   const scale = state.scale;
@@ -499,6 +671,7 @@ async function renderPageRecord(record) {
     record.surface = surface;
     record.canvas = canvas;
     record.textLayerElement = textLayerElement;
+    record.textLayerReady = false;
     const canvasContext = canvas.getContext("2d", { alpha: false });
     if (!canvasContext) {
       throw new Error(`第 ${record.number} 页无法创建 Canvas 绘图上下文。`);
@@ -510,24 +683,54 @@ async function renderPageRecord(record) {
       viewport,
       transform: outputScale === 1 ? undefined : [outputScale, 0, 0, outputScale, 0, 0]
     });
-    const textPromise = page.getTextContent();
-    const [, textContent] = await Promise.all([record.renderTask.promise, textPromise]);
-    if (isRenderStale(record, documentGeneration, renderGeneration, scale)) {
-      return;
-    }
-    record.textLayer = new pdfjs.TextLayer({
-      textContentSource: textContent,
-      container: textLayerElement,
-      viewport
-    });
-    await record.textLayer.render();
+    const canvasStartedAt = primary ? performance.now() : 0;
+    await record.renderTask.promise;
     if (isRenderStale(record, documentGeneration, renderGeneration, scale)) {
       return;
     }
     record.placeholder.hidden = true;
     record.renderedScale = scale;
-    record.status = "rendered";
+    record.status = "canvas";
+    record.shell.dataset.renderStage = "canvas";
     record.shell.querySelector(":scope > .page-refresh-snapshot")?.remove();
+    const imageBoundaryPromise = cachePageImageBoundaries(
+      record, page, viewport, documentGeneration, renderGeneration, scale
+    );
+    state.startupPreview = undefined;
+    if (primary) {
+      reportPerformance("PDF 首屏 Canvas", canvasStartedAt);
+      setStatus("PDF 页面已显示，正在准备文字选择……", "busy");
+      schedulePreviewCache(record, 120);
+    }
+    const textLayerStartedAt = primary ? performance.now() : 0;
+    try {
+      const textContent = await page.getTextContent();
+      if (isRenderStale(record, documentGeneration, renderGeneration, scale)) return;
+      record.textLayer = new pdfjs.TextLayer({
+        textContentSource: textContent,
+        container: textLayerElement,
+        viewport
+      });
+      await record.textLayer.render();
+      if (isRenderStale(record, documentGeneration, renderGeneration, scale)) return;
+      await imageBoundaryPromise;
+      if (isRenderStale(record, documentGeneration, renderGeneration, scale)) return;
+      record.textLayerReady = true;
+      record.status = "rendered";
+      record.shell.dataset.renderStage = "text";
+      if (primary) {
+        reportPerformance("PDF 首屏文字层", textLayerStartedAt);
+      }
+      if (record.number === state.currentPage) setStatus("PDF 已就绪。", "ready");
+    } catch (error) {
+      if (isCancellation(error) || isRenderStale(record, documentGeneration, renderGeneration, scale)) return;
+      record.textLayerElement?.remove();
+      record.textLayerElement = undefined;
+      record.textLayer = undefined;
+      record.status = "canvas";
+      console.error(error);
+      if (record.number === state.currentPage) setStatus("PDF 页面已显示，但文字选择层加载失败；请重新打开审阅窗口后重试。", "warning");
+    }
   } catch (error) {
     if (!isCancellation(error)) {
       record.shell.querySelector(":scope > .page-refresh-snapshot")?.remove();
@@ -551,6 +754,35 @@ async function renderPageRecord(record) {
   }
 }
 
+function schedulePreviewCache(record, delay = 0) {
+  if (!record?.canvas || !activePreviewKey) return;
+  const cache = () => {
+    try {
+      if (!record.canvas || record.status === "idle" || record.number !== state.currentPage) return;
+      const ratio = Math.min(1, 900 / record.canvas.width);
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(record.canvas.width * ratio));
+      canvas.height = Math.max(1, Math.round(record.canvas.height * ratio));
+      canvas.getContext("2d", { alpha: false })?.drawImage(record.canvas, 0, 0, canvas.width, canvas.height);
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.72);
+      canvas.width = 0;
+      canvas.height = 0;
+      post("cachePdfPreview", {
+        key: activePreviewKey,
+        page: record.number,
+        widthPt: record.widthPt,
+        heightPt: record.heightPt,
+        dataUrl
+      });
+      state.cachedPreviewSignature = activePreviewKey;
+      state.cachedPreviewPage = record.number;
+    } catch (error) {
+      console.error(error);
+    }
+  };
+  setTimeout(cache, delay);
+}
+
 function computeOutputScale(width, height) {
   const deviceScale = Math.min(window.devicePixelRatio || 1, 2);
   const maxPixels = state.scale > 2.1 ? 8_000_000 : 12_000_000;
@@ -566,7 +798,7 @@ function isRenderStale(record, documentGeneration, renderGeneration, scale) {
 }
 
 function releasePage(record, force = false) {
-  if (!force && record.number === state.selectedPage) {
+  if (!force && (record.number === state.selectedPage || state.selectedPages.has(record.number))) {
     return;
   }
   record.pendingRelease = true;
@@ -590,7 +822,11 @@ function disposeSurface(record) {
   record.surface = undefined;
   record.canvas = undefined;
   record.textLayerElement = undefined;
+  record.imageBoundaries = [];
+  delete record.shell.dataset.imageCount;
+  delete record.shell.dataset.imageBoundaries;
   record.pageProxy = undefined;
+  delete record.shell.dataset.renderStage;
   record.renderTask = undefined;
   record.textLayer = undefined;
   record.renderedScale = undefined;
@@ -673,7 +909,8 @@ function captureViewState() {
     scale: state.scale,
     fitMode: state.fitMode,
     selectionTool: state.selectionTool,
-    directEditEnabled: state.directEditEnabled
+    interactionMode: state.interactionMode,
+    directEditEnabled: state.interactionMode === "direct"
   };
 }
 
@@ -709,9 +946,14 @@ function scrollToPage(pageNumber, behavior = "smooth") {
 
 function updateSelectionToolUi() {
   elements.viewer.dataset.selectionTool = state.selectionTool;
-  elements.viewer.dataset.directEdit = String(state.directEditEnabled);
+  elements.viewer.dataset.directEdit = String(state.interactionMode === "direct");
+  elements.viewer.dataset.interactionMode = state.interactionMode;
   elements.regionSelect.setAttribute("aria-pressed", String(state.selectionTool === "region"));
-  elements.directEdit.setAttribute("aria-pressed", String(state.directEditEnabled));
+  elements.directEdit.setAttribute("aria-pressed", String(state.selectionTool === "text"));
+  elements.modeDirect.setAttribute("aria-pressed", String(state.interactionMode === "direct"));
+  elements.modeAgent.setAttribute("aria-pressed", String(state.interactionMode === "agent"));
+  elements.promptBar.hidden = state.interactionMode !== "agent";
+  elements.manualEditBar.hidden = state.interactionMode !== "direct";
   updateClearSelectionAvailability();
   updateManualEditAvailability();
 }
@@ -720,6 +962,7 @@ function updateClearSelectionAvailability() {
   elements.clearSelection.disabled = isWriteInteractionBusy() || !(
     state.regionDraft ||
     state.regionSelection ||
+    state.imageEditDraft ||
     state.directDraft ||
     state.selectionRequestId ||
     state.sessionId ||
@@ -731,37 +974,64 @@ function setSelectionTool(tool) {
   if (isWriteInteractionBusy()) {
     return;
   }
-  state.selectionTool = tool === "region" ? "region" : "text";
-  if (state.selectionTool === "region") {
-    state.directEditEnabled = false;
-    discardDirectDraft();
+  const requestedTool = tool === "region" ? "region" : "text";
+  const nextTool = requestedTool === state.selectionTool ? "none" : requestedTool;
+  if (state.imageEditDraft || state.directDraft?.text?.length > 0) {
+    if (state.imageEditDraft) {
+      setStatus("当前图片尺寸候选尚未确认，请先确认或取消。", "warning");
+      return;
+    }
+    setStatus("当前直接编辑草稿已有内容，请先提交或按 Esc 取消。", "warning");
+    elements.directInput.focus({ preventScroll: true });
+    return;
   }
+  discardDirectDraft();
+  state.selectionTool = nextTool;
   if (state.selectionTool !== "region") {
     cancelRegionDraft();
   }
   updateSelectionToolUi();
   scheduleStateSave();
-  setStatus(state.selectionTool === "region" ? "区域框选模式。" : "文字拖选模式。", "ready");
+  setStatus(
+    state.selectionTool === "region"
+      ? "已启用区域框选工具；再次单击可关闭。"
+      : state.selectionTool === "text"
+        ? "已启用文字或光标工具；再次单击可关闭。"
+        : "选择工具已关闭，可正常阅读和复制 PDF 文字。",
+    "ready"
+  );
 }
 
-function setDirectEditEnabled(enabled) {
+function setInteractionMode(mode) {
   if (isWriteInteractionBusy()) {
     return;
   }
-  state.directEditEnabled = Boolean(enabled);
-  if (state.directEditEnabled) {
-    state.selectionTool = "text";
-    cancelRegionDraft();
-    clearRegionSelection();
-  } else {
-    discardDirectDraft();
+  const nextMode = mode === "direct" ? "direct" : "agent";
+  if (nextMode === state.interactionMode) {
+    return;
   }
+  if (state.selectionRequestId) {
+    setStatus("正在定位当前选区，请等待定位完成后再切换处理方式。", "warning");
+    return;
+  }
+  if (state.imageEditDraft || state.directDraft?.text?.length > 0) {
+    if (state.imageEditDraft) {
+      setStatus("当前图片尺寸候选尚未确认，请先确认或取消。", "warning");
+      return;
+    }
+    setStatus("当前直接编辑草稿已有内容，请先提交或按 Esc 取消。", "warning");
+    elements.directInput.focus({ preventScroll: true });
+    return;
+  }
+  discardDirectDraft();
+  state.interactionMode = nextMode;
+  state.interactionVersion += 1;
   updateSelectionToolUi();
   scheduleStateSave();
   setStatus(
-    state.directEditEnabled
-      ? "直接编辑模式：拖选可替换或批量删除；单击光标每个草稿处理一个相邻字素，Ctrl+Enter 提交。"
-      : "已退出直接编辑模式。",
+    state.interactionMode === "direct"
+      ? "直接编辑模式：文字和区域框选均可替换或删除；文字工具还支持光标插入。"
+      : "Agent 模式：使用当前选择工具建立选区后输入任务要求。",
     "ready"
   );
 }
@@ -849,9 +1119,13 @@ function finishRegionDraft(event) {
 
   try {
     const extracted = extractRegionContent(record, bounds);
-    if (!extracted.text) {
-      updateClearSelectionAvailability();
-      setStatus("该区域没有可提取的 PDF 文字。", "warning");
+    if (!extracted.text || isPredominantlyGraphicRegion(record, bounds, extracted)) {
+      if (state.interactionMode !== "direct") {
+        updateClearSelectionAvailability();
+        setStatus("该区域没有可提取的 PDF 文字。图片尺寸调整请切换到直编。", "warning");
+        return;
+      }
+      beginImageEditLocation(record, bounds);
       return;
     }
     if (extracted.text.length > 10_000) {
@@ -868,19 +1142,51 @@ function finishRegionDraft(event) {
     };
     renderRegionSelection(record);
     beginLocalSelection(record.number, extracted.text.length, "区域框选");
+    state.selectedPages = new Set([record.number]);
     state.selectedPage = record.number;
     const requestId = createId();
     state.selectionRequestId = requestId;
+    const interactionVersion = state.interactionVersion;
     post("selection", {
       requestId,
       selectionKind: "region",
+      interactionMode: state.interactionMode,
+      interactionVersion,
       text: extracted.text,
       page: record.number,
       start: extracted.start,
       end: extracted.end,
       bounds,
-      anchors: extracted.anchors
+      anchors: extracted.anchors,
+      fragments: extracted.fragments
     });
+    if (state.interactionMode === "direct") {
+      const normalizedRects = extracted.highlights.map((rect) => ({
+        page: record.number,
+        x: rect.x / record.widthPt,
+        y: rect.y / record.heightPt,
+        width: rect.width / record.widthPt,
+        height: rect.height / record.heightPt
+      }));
+      state.textSelection = { pageNumber: record.number, rects: normalizedRects };
+      state.directDraft = {
+        page: record.number,
+        rects: normalizedRects,
+        selectionRects: normalizedRects,
+        backwardRects: [],
+        forwardRects: [],
+        selectionKind: "region",
+        baseKind: "replace",
+        kind: "replace",
+        text: "",
+        selectionRequestId: requestId,
+        interactionVersion,
+        mapped: false,
+        commitRequested: false
+      };
+      renderAllDirectDraftOverlays(record.number);
+      setStatus("区域直接编辑草稿已建立，输入文字替换整个区域，或按 Delete 删除。", "ready");
+    }
     updateVisiblePages();
     updateClearSelectionAvailability();
   } catch (error) {
@@ -917,6 +1223,275 @@ function clearRegionSelection() {
   state.regionSelection = undefined;
 }
 
+function buildImageAnchors(bounds) {
+  const insetX = Math.min(bounds.width * 0.12, 8);
+  const insetY = Math.min(bounds.height * 0.12, 8);
+  const left = bounds.x + insetX;
+  const right = bounds.x + bounds.width - insetX;
+  const top = bounds.y + insetY;
+  const bottom = bounds.y + bounds.height - insetY;
+  const centerX = bounds.x + bounds.width / 2;
+  const centerY = bounds.y + bounds.height / 2;
+  return [
+    { x: centerX, y: centerY },
+    { x: left, y: top }, { x: right, y: top },
+    { x: left, y: bottom }, { x: right, y: bottom },
+    { x: centerX, y: top }, { x: centerX, y: bottom },
+    { x: left, y: centerY }, { x: right, y: centerY }
+  ];
+}
+
+async function cachePageImageBoundaries(record, page, viewport, documentGeneration, renderGeneration, scale) {
+  try {
+    const operatorList = await page.getOperatorList();
+    if (isRenderStale(record, documentGeneration, renderGeneration, scale)) return;
+    record.imageBoundaries = extractPdfImageBoundaries(operatorList, viewport, record.widthPt, record.heightPt);
+    record.shell.dataset.imageCount = String(record.imageBoundaries.length);
+    record.shell.dataset.imageBoundaries = JSON.stringify(record.imageBoundaries);
+  } catch (error) {
+    record.imageBoundaries = [];
+    record.shell.dataset.imageCount = "0";
+    delete record.shell.dataset.imageBoundaries;
+    console.error(error);
+  }
+}
+
+function extractPdfImageBoundaries(operatorList, viewport, pageWidth, pageHeight) {
+  const boundaries = [];
+  const stack = [];
+  let transform = [1, 0, 0, 1, 0, 0];
+  for (let index = 0; index < operatorList.fnArray.length; index += 1) {
+    const operation = operatorList.fnArray[index];
+    const args = operatorList.argsArray[index] ?? [];
+    if (operation === pdfjs.OPS.save) {
+      stack.push(transform.slice());
+    } else if (operation === pdfjs.OPS.restore) {
+      transform = stack.pop() ?? [1, 0, 0, 1, 0, 0];
+    } else if (operation === pdfjs.OPS.transform && args.length >= 6) {
+      transform = multiplyPdfTransform(transform, args.slice(0, 6));
+    } else if ([pdfjs.OPS.paintImageXObject, pdfjs.OPS.paintInlineImageXObject].includes(operation)) {
+      const corners = [
+        applyPdfTransform(viewport.transform, applyPdfTransform(transform, [0, 0])),
+        applyPdfTransform(viewport.transform, applyPdfTransform(transform, [1, 0])),
+        applyPdfTransform(viewport.transform, applyPdfTransform(transform, [0, 1])),
+        applyPdfTransform(viewport.transform, applyPdfTransform(transform, [1, 1]))
+      ];
+      const xs = corners.map((point) => point[0] / viewport.scale);
+      const ys = corners.map((point) => point[1] / viewport.scale);
+      const x = clamp(Math.min(...xs), 0, pageWidth);
+      const y = clamp(Math.min(...ys), 0, pageHeight);
+      const right = clamp(Math.max(...xs), 0, pageWidth);
+      const bottom = clamp(Math.max(...ys), 0, pageHeight);
+      const width = right - x;
+      const height = bottom - y;
+      if (width >= 8 && height >= 8 && width * height >= 400) {
+        boundaries.push({
+          x, y, width, height,
+          objectName: typeof args[0] === "string" ? args[0] : `inline-${index}`,
+          pixelWidth: Number.isFinite(args[1]) ? args[1] : undefined,
+          pixelHeight: Number.isFinite(args[2]) ? args[2] : undefined
+        });
+      }
+    }
+  }
+  return deduplicateImageBoundaries(boundaries);
+}
+
+function multiplyPdfTransform(left, right) {
+  return [
+    left[0] * right[0] + left[2] * right[1],
+    left[1] * right[0] + left[3] * right[1],
+    left[0] * right[2] + left[2] * right[3],
+    left[1] * right[2] + left[3] * right[3],
+    left[0] * right[4] + left[2] * right[5] + left[4],
+    left[1] * right[4] + left[3] * right[5] + left[5]
+  ];
+}
+
+function applyPdfTransform(transform, point) {
+  return [
+    transform[0] * point[0] + transform[2] * point[1] + transform[4],
+    transform[1] * point[0] + transform[3] * point[1] + transform[5]
+  ];
+}
+
+function deduplicateImageBoundaries(boundaries) {
+  return boundaries.filter((boundary, index) => !boundaries.some((other, otherIndex) => otherIndex < index &&
+    Math.abs(boundary.x - other.x) < 0.5 && Math.abs(boundary.y - other.y) < 0.5 &&
+    Math.abs(boundary.width - other.width) < 0.5 && Math.abs(boundary.height - other.height) < 0.5
+  ));
+}
+
+function selectSnappedImageBoundary(bounds, boundaries) {
+  const selectionArea = bounds.width * bounds.height;
+  const center = { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 };
+  const matches = boundaries.map((boundary) => {
+    const intersectionWidth = Math.max(0, Math.min(bounds.x + bounds.width, boundary.x + boundary.width) - Math.max(bounds.x, boundary.x));
+    const intersectionHeight = Math.max(0, Math.min(bounds.y + bounds.height, boundary.y + boundary.height) - Math.max(bounds.y, boundary.y));
+    const intersection = intersectionWidth * intersectionHeight;
+    const imageArea = boundary.width * boundary.height;
+    const intersectionOverSelection = intersection / selectionArea;
+    const intersectionOverImage = intersection / imageArea;
+    const centerInside = center.x >= boundary.x && center.x <= boundary.x + boundary.width &&
+      center.y >= boundary.y && center.y <= boundary.y + boundary.height;
+    const imageCenter = { x: boundary.x + boundary.width / 2, y: boundary.y + boundary.height / 2 };
+    const centerScore = Math.max(0, 1 - Math.hypot(center.x - imageCenter.x, center.y - imageCenter.y) /
+      Math.max(1, Math.hypot(bounds.width, bounds.height)));
+    return {
+      boundary,
+      centerInside,
+      intersectionOverSelection,
+      intersectionOverImage,
+      score: intersectionOverSelection * 0.3 + intersectionOverImage * 0.45 + centerScore * 0.1 + (centerInside ? 0.15 : 0)
+    };
+  }).filter((match) => match.intersectionOverSelection >= 0.06 && match.intersectionOverImage >= 0.12)
+    .sort((left, right) => right.score - left.score);
+  const best = matches[0];
+  if (!best || best.score < 0.34) throw new Error("粗选区域没有覆盖可识别的嵌入图片，请扩大选框使其覆盖图片主体。");
+  const runnerUp = matches[1];
+  if (runnerUp && best.score - runnerUp.score < 0.1 && (runnerUp.centerInside === best.centerInside || runnerUp.score >= best.score * 0.86)) {
+    throw new Error("粗选区域同时覆盖多张图片，无法确定唯一目标。请缩小选框，只覆盖一张图片主体。");
+  }
+  return best.boundary;
+}
+
+function beginImageEditLocation(record, bounds) {
+  const snapped = selectSnappedImageBoundary(bounds, record.imageBoundaries ?? []);
+  const requestId = createId();
+  state.imageLocateRequestId = requestId;
+  state.regionSelection = {
+    pageNumber: record.number,
+    bounds: snapped,
+    roughBounds: bounds,
+    highlights: [],
+    element: undefined,
+    image: true
+  };
+  renderRegionSelection(record);
+  state.busyAction = "locateImage";
+  updateManualEditAvailability();
+  updateClearSelectionAvailability();
+  setStatus("正在定位框选图片对应的 LaTeX 命令……", "busy");
+  post("locateImage", {
+    requestId,
+    interactionVersion: state.interactionVersion,
+    page: record.number,
+    pageWidth: record.widthPt,
+    pageHeight: record.heightPt,
+    bounds: snapped,
+    roughBounds: bounds,
+    imageObjectName: snapped.objectName,
+    anchors: buildImageAnchors(snapped)
+  });
+}
+
+function clearImageEditDraft() {
+  state.imageEditDraft = undefined;
+  state.imageLocateRequestId = undefined;
+  state.imageQueueRequestId = undefined;
+  for (const overlay of document.querySelectorAll(".image-edit-draft-overlay")) overlay.remove();
+}
+
+function adjustImageEditDraft(direction) {
+  const draft = state.imageEditDraft;
+  if (!draft || isWriteInteractionBusy()) return;
+  const step = direction > 0 ? 0.05 : -0.05;
+  draft.factor = clamp(Number((draft.factor + step).toFixed(2)), 0.25, 3);
+  renderImageEditDraft();
+  updateClearSelectionAvailability();
+}
+
+function queueImageEditDraft() {
+  const draft = state.imageEditDraft;
+  if (!draft || isWriteInteractionBusy()) return;
+  if (Math.abs(draft.factor - 1) < 0.0001) {
+    setStatus("图片尺寸尚未调整，请先单击放大或缩小。", "warning");
+    return;
+  }
+  const requestId = createId();
+  state.imageQueueRequestId = requestId;
+  state.busyAction = "queueImageEdit";
+  updateManualEditAvailability();
+  setStatus("正在加入图片尺寸调整……", "busy");
+  post("queueImageEdit", {
+    requestId,
+    targetId: draft.targetId,
+    factor: draft.factor,
+    queueVersion: state.manualEditQueueVersion
+  });
+}
+
+function cancelImageEditDraft() {
+  if (!state.imageEditDraft && !state.imageLocateRequestId) return false;
+  clearImageEditDraft();
+  clearRegionSelection();
+  state.busyAction = undefined;
+  updateManualEditAvailability();
+  updateClearSelectionAvailability();
+  setStatus("已取消图片尺寸调整。", "ready");
+  return true;
+}
+
+function renderImageEditDraft() {
+  for (const overlay of document.querySelectorAll(".image-edit-draft-overlay")) overlay.remove();
+  const draft = state.imageEditDraft;
+  const record = draft ? state.pageStates[draft.page - 1] : undefined;
+  const rect = draft?.rects?.[0];
+  if (!draft || !record || !rect) return;
+  const overlay = document.createElement("div");
+  overlay.className = "image-edit-draft-overlay";
+  const preview = document.createElement("div");
+  preview.className = "image-edit-preview";
+  const original = document.createElement("div");
+  original.className = "image-edit-original";
+  applyNormalizedRectStyle(original, rect);
+  const scaledWidth = clamp(rect.width * draft.factor, 0.01, 1);
+  const scaledHeight = clamp(rect.height * draft.factor, 0.01, 1);
+  const centerX = rect.x + rect.width / 2;
+  const centerY = rect.y + rect.height / 2;
+  applyNormalizedRectStyle(preview, {
+    x: clamp(centerX - scaledWidth / 2, 0, 1 - scaledWidth),
+    y: clamp(centerY - scaledHeight / 2, 0, 1 - scaledHeight),
+    width: scaledWidth,
+    height: scaledHeight
+  });
+  const controls = document.createElement("div");
+  controls.className = "image-edit-controls";
+  controls.addEventListener("pointerdown", (event) => event.stopPropagation());
+  controls.addEventListener("pointerup", (event) => event.stopPropagation());
+  controls.addEventListener("click", (event) => event.stopPropagation());
+  controls.style.left = `${clamp(rect.x + rect.width, 0.05, 0.98) * 100}%`;
+  controls.style.top = `${clamp(rect.y, 0.02, 0.96) * 100}%`;
+  const enlarge = document.createElement("button");
+  enlarge.type = "button";
+  enlarge.textContent = "↑";
+  enlarge.title = "放大 5%";
+  enlarge.setAttribute("aria-label", "图片放大 5%");
+  enlarge.addEventListener("click", () => adjustImageEditDraft(1));
+  const shrink = document.createElement("button");
+  shrink.type = "button";
+  shrink.textContent = "↓";
+  shrink.title = "缩小 5%";
+  shrink.setAttribute("aria-label", "图片缩小 5%");
+  shrink.addEventListener("click", () => adjustImageEditDraft(-1));
+  const value = document.createElement("span");
+  value.className = "image-edit-value";
+  value.textContent = `${draft.originalValue} → ${Math.round(draft.factor * 100)}%`;
+  value.title = draft.imagePath;
+  const confirm = document.createElement("button");
+  confirm.type = "button";
+  confirm.textContent = "确认";
+  confirm.disabled = Math.abs(draft.factor - 1) < 0.0001;
+  confirm.addEventListener("click", queueImageEditDraft);
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.textContent = "取消";
+  cancel.addEventListener("click", cancelImageEditDraft);
+  controls.append(enlarge, shrink, value, confirm, cancel);
+  overlay.append(original, preview, controls);
+  record.shell.append(overlay);
+}
+
 function renderRegionDraft() {
   const draft = state.regionDraft;
   const record = draft ? state.pageStates[draft.pageNumber - 1] : undefined;
@@ -941,9 +1516,15 @@ function renderRegionSelection(record) {
   const overlay = document.createElement("div");
   overlay.className = "region-selection-overlay";
   const outline = document.createElement("div");
-  outline.className = "region-selection-outline";
+  outline.className = `region-selection-outline${selection.image ? " region-selection-outline-image" : ""}`;
   applyPdfRectStyle(outline, selection.bounds);
   overlay.append(outline);
+  if (selection.image && selection.roughBounds) {
+    const rough = document.createElement("div");
+    rough.className = "region-selection-rough";
+    applyPdfRectStyle(rough, selection.roughBounds);
+    overlay.append(rough);
+  }
   for (const rect of selection.highlights) {
     const hit = document.createElement("div");
     hit.className = "region-selection-hit";
@@ -956,7 +1537,9 @@ function renderRegionSelection(record) {
 
 function renderManualEditOverlay(record) {
   record.shell.querySelector(":scope > .manual-edit-overlay")?.remove();
-  const edits = state.pendingManualEdits.filter((edit) => edit.page === record.number);
+  const edits = state.pendingManualEdits.filter((edit) =>
+    edit.rects.some((rect) => (rect.page ?? edit.page) === record.number)
+  );
   if (edits.length === 0) {
     return;
   }
@@ -968,8 +1551,16 @@ function renderManualEditOverlay(record) {
     const group = document.createElement("div");
     group.className = `manual-edit manual-edit-${edit.kind}`;
     group.dataset.editId = edit.id;
-    if (edit.kind === "delete" || edit.kind === "replace") {
-      for (const rect of edit.rects) {
+    if (edit.editType === "image") {
+      for (const rect of edit.rects.filter((item) => (item.page ?? edit.page) === record.number)) {
+        const image = document.createElement("div");
+        image.className = "manual-edit-image";
+        image.title = `${edit.originalValue} → ${edit.candidateValue}`;
+        applyNormalizedRectStyle(image, rect);
+        group.append(image);
+      }
+    } else if (edit.kind === "delete" || edit.kind === "replace") {
+      for (const rect of edit.rects.filter((item) => (item.page ?? edit.page) === record.number)) {
         const deletion = document.createElement("div");
         deletion.className = "manual-edit-deletion";
         applyNormalizedRectStyle(deletion, rect);
@@ -978,7 +1569,13 @@ function renderManualEditOverlay(record) {
     }
 
     if (edit.kind !== "delete" && edit.insertedText) {
-      const anchor = edit.kind === "insertAfter" ? edit.rects.at(-1) : edit.rects[0];
+      const pageRects = edit.rects.filter((item) => (item.page ?? edit.page) === record.number);
+      const anchorPage = edit.kind === "insertAfter"
+        ? Math.max(...edit.rects.map((item) => item.page ?? edit.page))
+        : Math.min(...edit.rects.map((item) => item.page ?? edit.page));
+      const anchor = record.number === anchorPage
+        ? edit.kind === "insertAfter" ? pageRects.at(-1) : pageRects[0]
+        : undefined;
       if (anchor) {
         const insertion = document.createElement("span");
         insertion.className = `manual-edit-insertion manual-edit-insertion-${edit.kind}`;
@@ -1043,7 +1640,8 @@ function renderDirectDraft(record, focusInput = false) {
   }
   existing?.remove();
   const draft = state.directDraft;
-  if (!draft || draft.page !== record.number) {
+  const pageRects = draft?.rects.filter((rect) => (rect.page ?? draft.page) === record.number) ?? [];
+  if (!draft || pageRects.length === 0) {
     return;
   }
 
@@ -1051,15 +1649,15 @@ function renderDirectDraft(record, focusInput = false) {
   overlay.className = "direct-edit-draft-overlay";
   overlay.dataset.kind = draft.kind;
   overlay.dataset.pageNumber = String(record.number);
-  for (const rect of draft.rects) {
+  for (const rect of pageRects) {
     const target = document.createElement("div");
     target.className = "direct-edit-draft-target";
     applyNormalizedRectStyle(target, rect);
     overlay.append(target);
   }
 
-  const first = draft.rects[0];
-  const last = draft.rects.at(-1) ?? first;
+  const first = pageRects[0];
+  const last = pageRects.at(-1) ?? first;
   if (!first || !last) {
     return;
   }
@@ -1075,6 +1673,12 @@ function renderDirectDraft(record, focusInput = false) {
   caret.style.top = `${clamp(anchorY, 0, 1) * 100}%`;
   caret.style.height = `${Math.max(0.012, draft.caretRect?.height ?? first.height) * 100}%`;
   overlay.append(caret);
+
+  const inputPage = Math.max(...draft.rects.map((rect) => rect.page ?? draft.page));
+  if (record.number !== inputPage) {
+    record.shell.append(overlay);
+    return;
+  }
 
   elements.directInput.hidden = false;
   elements.directInput.dataset.kind = draft.kind;
@@ -1118,13 +1722,49 @@ function renderDirectDraft(record, focusInput = false) {
   }
 }
 
+function beginTextSelectionDrag(event) {
+  if (state.selectionTool !== "text" || event.button !== 0 || isWriteInteractionBusy()) return;
+  const page = Number(event.target.closest?.(".pdf-page")?.dataset.pageNumber);
+  if (!positivePage(page)) return;
+  state.textSelectionDrag = { startPage: page, endPage: page };
+  state.selectedPages = new Set([page]);
+}
+
+function moveTextSelectionDrag(event) {
+  const drag = state.textSelectionDrag;
+  if (!drag || (event.buttons & 1) === 0) return;
+  const page = Number(document.elementFromPoint(event.clientX, event.clientY)?.closest?.(".pdf-page")?.dataset.pageNumber);
+  if (!positivePage(page)) return;
+  const start = Math.min(drag.startPage, page);
+  const end = Math.max(drag.startPage, page);
+  if (end - start + 1 > 12) return;
+  drag.endPage = page;
+  state.selectedPages = new Set(Array.from({ length: end - start + 1 }, (_, index) => start + index));
+  updateVisiblePages();
+}
+
+function finishTextSelectionDrag() {
+  if (!state.textSelectionDrag) return;
+  state.textSelectionDrag = undefined;
+  if (!state.textSelection && !state.selectionRequestId && !state.sessionId) {
+    state.selectedPages = new Set();
+    updateVisiblePages();
+  }
+}
+
+function renderAllDirectDraftOverlays(focusPage) {
+  for (const record of state.pageStates) {
+    renderDirectDraft(record, record.number === focusPage);
+  }
+}
+
 function updateDirectDraftPresentation() {
   const draft = state.directDraft;
-  const overlay = document.querySelector(".direct-edit-draft-overlay");
-  if (!draft || !overlay) {
+  const overlays = document.querySelectorAll(".direct-edit-draft-overlay");
+  if (!draft || overlays.length === 0) {
     return;
   }
-  overlay.dataset.kind = draft.kind;
+  for (const overlay of overlays) overlay.dataset.kind = draft.kind;
   elements.directInput.dataset.kind = draft.kind;
   elements.directInput.placeholder = draft.kind === "delete"
     ? draft.caretVisibleOffset !== undefined
@@ -1176,7 +1816,8 @@ function extractRegionContent(record, bounds) {
     return { text: "", highlights: [] };
   }
   const lines = groupRegionTextUnits(units);
-  const textLines = lines.map((line) => buildRegionLineText(line.units)).filter(Boolean);
+  const fragments = buildRegionFragments(lines, pageRect, record, bounds);
+  const textLines = fragments.map((fragment) => fragment.text);
   if (textLines.length === 0) {
     return { text: "", highlights: [] };
   }
@@ -1188,8 +1829,56 @@ function extractRegionContent(record, bounds) {
     start: clientRectCenterToPdf(first, pageRect, record),
     end: clientRectCenterToPdf(last, pageRect, record),
     anchors: buildRegionAnchors(lines, pageRect, record),
-    highlights: buildRegionHighlights(lines, pageRect, record)
+    highlights: buildRegionHighlights(lines, pageRect, record),
+    fragments
   };
+}
+
+function isPredominantlyGraphicRegion(record, bounds, extracted) {
+  if (!extracted.text) return true;
+  const regionArea = Math.max(1, bounds.width * bounds.height);
+  const textArea = extracted.highlights.reduce((sum, rect) => sum + rect.width * rect.height, 0);
+  const pageRatio = regionArea / Math.max(1, record.widthPt * record.heightPt);
+  const textCoverage = textArea / regionArea;
+  return pageRatio >= 0.025 && textCoverage < 0.09 && extracted.text.replace(/\s/gu, "").length < 160;
+}
+
+function buildRegionFragments(lines, pageRect, record, bounds) {
+  const fragments = [];
+  lines.forEach((line, lineIndex) => {
+    const visibleUnits = line.units.filter((unit) => !/^\s+$/u.test(unit.symbol));
+    for (const cluster of splitRegionLineClusters(visibleUnits, pageRect.width)) {
+      const text = buildRegionLineText(cluster);
+      if (!text) continue;
+      const first = cluster[0];
+      const last = cluster.at(-1);
+      fragments.push({
+        text,
+        start: clientRectCenterToPdf(first, pageRect, record),
+        end: clientRectCenterToPdf(last, pageRect, record),
+        rects: sampleRegionRects(buildRegionHighlights([{ units: cluster }], pageRect, record)
+          .map((rect) => intersectPdfRect(rect, bounds))
+          .filter((rect) => rect.width > 0 && rect.height > 0)),
+        lineIndex
+      });
+    }
+  });
+  return fragments;
+}
+
+function sampleRegionRects(rects) {
+  if (rects.length <= 32) return rects;
+  return Array.from({ length: 32 }, (_, index) =>
+    rects[Math.round(index * (rects.length - 1) / 31)]
+  );
+}
+
+function intersectPdfRect(rect, bounds) {
+  const x = Math.max(rect.x, bounds.x);
+  const y = Math.max(rect.y, bounds.y);
+  const right = Math.min(rect.x + rect.width, bounds.x + bounds.width);
+  const bottom = Math.min(rect.y + rect.height, bounds.y + bounds.height);
+  return { x, y, width: Math.max(0, right - x), height: Math.max(0, bottom - y) };
 }
 
 function buildRegionAnchors(lines, pageRect, record) {
@@ -1687,6 +2376,10 @@ function buildCaretCapture(event) {
     spec: {
       kind: useBeforeEdge ? "insertAfter" : "insertBefore",
       caretRawOffset: boundaryOffset - startOffset,
+      caretPoint: {
+        x: clamp(caretX, 0, 1) * record.widthPt,
+        y: clamp(reference.y + reference.height / 2, 0, 1) * record.heightPt
+      },
       caretRect,
       backwardRects: beforeRects,
       forwardRects: afterRects
@@ -1695,7 +2388,7 @@ function buildCaretCapture(event) {
 }
 
 function handleDirectEditClick(event) {
-  if (!state.directEditEnabled || state.selectionTool !== "text" || isWriteInteractionBusy()) {
+  if (state.interactionMode !== "direct" || state.selectionTool !== "text" || isWriteInteractionBusy()) {
     return;
   }
   const selection = window.getSelection();
@@ -1720,7 +2413,7 @@ function captureSelection() {
     state.directIgnoreNextSelectionCapture = false;
     return;
   }
-  if (state.selectionTool === "region" || isWriteInteractionBusy()) {
+  if (state.selectionTool !== "text" || isWriteInteractionBusy()) {
     return;
   }
   const selection = window.getSelection();
@@ -1733,96 +2426,93 @@ function captureSelection() {
   if (!startLayer || !endLayer) {
     return;
   }
-  if (startLayer !== endLayer) {
-    clearLocalSession(true);
-    setStatus("暂不支持跨页选区，请在单页内重新划选。", "warning");
+  const startPage = Number(startLayer.dataset.pageNumber);
+  const endPage = Number(endLayer.dataset.pageNumber);
+  if (!Number.isInteger(startPage) || !Number.isInteger(endPage) || endPage < startPage) {
     return;
   }
-  const pageNumber = Number(startLayer.dataset.pageNumber);
-  const record = state.pageStates[pageNumber - 1];
-  if (!record || record.rotation !== 0) {
+  if (endPage - startPage + 1 > 12) {
+    clearLocalSession(true);
+    setStatus("跨页文字选区最多支持连续 12 页，请缩小范围。", "warning");
+    return;
+  }
+  const selectedRecords = state.pageStates.slice(startPage - 1, endPage);
+  if (selectedRecords.some((record) => record?.rotation !== 0)) {
     clearLocalSession(true);
     setStatus("当前版本暂不支持旋转页面的 SyncTeX 定位。", "error");
     return;
   }
-  const rawText = selection.toString();
-  const text = rawText.trim();
+  let pageFragments;
+  try {
+    pageFragments = buildTextPageFragments(range, startPage, endPage);
+  } catch (error) {
+    clearLocalSession(true);
+    setStatus(error.message || String(error), "warning");
+    return;
+  }
+  const text = pageFragments.map((fragment) => fragment.text).join("\n").trim();
   if (!text) {
     return;
   }
-  const layerRect = startLayer.getBoundingClientRect();
-  if (layerRect.width <= 0 || layerRect.height <= 0) {
-    return;
-  }
-  const rects = [...range.getClientRects()].filter((rect) =>
-    rect.width > 0 && rect.height > 0 &&
-    rect.right > layerRect.left && rect.left < layerRect.right &&
-    rect.bottom > layerRect.top && rect.top < layerRect.bottom
-  );
-  if (rects.length === 0) {
-    return;
-  }
-  const pageRect = record.shell.getBoundingClientRect();
-  const normalizedRects = normalizeTextSelectionRects(rects, pageRect);
-  if (normalizedRects.length === 0) {
-    return;
-  }
-  const first = rects[0];
-  const last = rects.at(-1);
-  const toPoint = (rect, useRight) => {
-    const inset = Math.min(rect.width * 0.2, 3);
-    const rawX = ((useRight ? rect.right - inset : rect.left + inset) - layerRect.left) * record.widthPt / layerRect.width;
-    const rawY = (rect.top + rect.height / 2 - layerRect.top) * record.heightPt / layerRect.height;
-    return {
-      x: clamp(rawX, 0.5, record.widthPt - 0.5),
-      y: clamp(rawY, 0.5, record.heightPt - 0.5)
-    };
-  };
 
   const directCaptureSpec = state.directCaptureSpec;
-  const selectionContext = captureTextSelectionContext(startLayer, range);
+  const selectionContext = captureTextSelectionContext(startLayer, endLayer, range);
   state.directCaptureSpec = undefined;
   discardDirectDraft();
   clearRegionSelection();
-  beginLocalSelection(pageNumber, text.length, "文字选区");
-  state.textSelection = { pageNumber, rects: normalizedRects };
-  state.selectedPage = pageNumber;
+  const pageLabel = startPage === endPage ? startPage : `${startPage}--${endPage}`;
+  beginLocalSelection(pageLabel, text.length, startPage === endPage ? "文字选区" : "跨页文字选区");
+  const normalizedRects = sampleCrossPageRects(pageFragments, 64);
+  state.textSelection = { pageNumber: startPage, endPageNumber: endPage, rects: normalizedRects };
+  state.selectedPages = new Set(pageFragments.map((fragment) => fragment.page));
+  state.selectedPage = startPage;
   const requestId = createId();
   state.selectionRequestId = requestId;
   post("selection", {
     requestId,
     selectionKind: "text",
+    interactionMode: state.interactionMode,
+    interactionVersion: state.interactionVersion,
     text,
-    page: pageNumber,
-    start: toPoint(first, false),
-    end: toPoint(last, true),
+    page: startPage,
+    start: pageFragments[0].start,
+    end: pageFragments.at(-1).end,
+    pageFragments: pageFragments.map(({ page, text: fragmentText, start, end }) => ({
+      page,
+      text: fragmentText,
+      start,
+      end
+    })),
     contextBefore: selectionContext.before,
-    contextAfter: selectionContext.after
+    contextAfter: selectionContext.after,
+    ...(directCaptureSpec?.caretPoint ? { caretPoint: directCaptureSpec.caretPoint } : {})
   });
-  if (state.directEditEnabled) {
+  if (state.interactionMode === "direct") {
     const spec = directCaptureSpec;
-    const leadingTrimLength = rawText.length - rawText.trimStart().length;
+    const leadingTrimLength = text.length - text.trimStart().length;
     const caretRawOffset = spec?.caretRawOffset;
     const caretVisibleOffset = Number.isInteger(caretRawOffset)
-      ? visibleTextLength(rawText.slice(leadingTrimLength, clamp(caretRawOffset, leadingTrimLength, leadingTrimLength + text.length)))
+      ? visibleTextLength(text.slice(leadingTrimLength, clamp(caretRawOffset, leadingTrimLength, leadingTrimLength + text.length)))
       : undefined;
     const kind = spec?.kind ?? "replace";
     state.directDraft = {
-      page: pageNumber,
-      rects: spec?.caretRect ? [spec.caretRect] : normalizedRects,
+      page: startPage,
+      endPage,
+      rects: spec?.caretRect ? [{ ...spec.caretRect, page: startPage }] : normalizedRects,
       selectionRects: normalizedRects,
-      caretRect: spec?.caretRect,
-      backwardRects: spec?.backwardRects ?? [],
-      forwardRects: spec?.forwardRects ?? [],
+      caretRect: spec?.caretRect ? { ...spec.caretRect, page: startPage } : undefined,
+      backwardRects: (spec?.backwardRects ?? []).map((rect) => ({ ...rect, page: startPage })),
+      forwardRects: (spec?.forwardRects ?? []).map((rect) => ({ ...rect, page: startPage })),
       caretVisibleOffset,
       baseKind: kind,
       kind,
       text: "",
       selectionRequestId: requestId,
+      interactionVersion: state.interactionVersion,
       mapped: false,
       commitRequested: false
     };
-    renderDirectDraft(record, true);
+    renderAllDirectDraftOverlays(endPage);
     setStatus("直接编辑草稿已建立，输入文字后按 Ctrl+Enter 提交，Esc 取消。", "ready");
   } else {
     state.directCaptureSpec = undefined;
@@ -1831,13 +2521,19 @@ function captureSelection() {
   updateVisiblePages();
 }
 
-function captureTextSelectionContext(layer, range) {
-  const startBoundary = normalizeCaretBoundary(range.startContainer, range.startOffset, layer);
-  const endBoundary = normalizeCaretBoundary(range.endContainer, range.endOffset, layer);
+function captureTextSelectionContext(startLayer, endLayer, range) {
+  const startBoundary = normalizeCaretBoundary(range.startContainer, range.startOffset, startLayer);
+  const endBoundary = normalizeCaretBoundary(range.endContainer, range.endOffset, endLayer);
   if (!startBoundary || !endBoundary) {
     return { before: "", after: "" };
   }
-  const nodes = textNodesInLayer(layer);
+  if (startLayer !== endLayer) {
+    return {
+      before: textBeforeBoundary(startLayer, startBoundary).slice(-256),
+      after: textAfterBoundary(endLayer, endBoundary).slice(0, 256)
+    };
+  }
+  const nodes = textNodesInLayer(startLayer);
   let text = "";
   let startOffset;
   let endOffset;
@@ -1890,6 +2586,7 @@ function beginLocalSelection(pageNumber, textLength, label = "文字选区") {
   state.rangeRequestId = undefined;
   state.selectionLabel = label;
   state.textSelection = undefined;
+  state.selectedPages = new Set();
   elements.selectionDetails.hidden = false;
   elements.selectionDetails.open = false;
   elements.selectionSummary.textContent = `第 ${pageNumber} 页 · ${label} · ${textLength} 字 · 定位中`;
@@ -1914,6 +2611,7 @@ function clearLocalSession(notifyBackend = false) {
     post("clearSession", { sessionId: state.sessionId });
   }
   discardDirectDraft();
+  clearImageEditDraft();
   window.getSelection()?.removeAllRanges();
   clearRegionSelection();
   state.sessionId = undefined;
@@ -1924,6 +2622,8 @@ function clearLocalSession(notifyBackend = false) {
   state.requiresConfirmation = false;
   state.rangeConfirmed = false;
   state.selectedPage = undefined;
+  state.selectedPages = new Set();
+  state.textSelectionDrag = undefined;
   state.analyzing = false;
   state.selectionLabel = "文字选区";
   state.textSelection = undefined;
@@ -1976,16 +2676,162 @@ function requestSourceDetail() {
 function updateAnalyzeAvailability() {
   const hasInstruction = elements.instruction.value.trim().length > 0;
   const confirmed = !state.requiresConfirmation || state.rangeConfirmed;
-  elements.analyze.disabled = !state.mappingId || !hasInstruction || !confirmed || state.analyzing ||
-    state.pendingManualEditCount > 0 || Boolean(state.directDraft) || Boolean(state.candidateId) || isWriteInteractionBusy();
+  const skill = selectedSkill();
+  const requiresSelection = state.selectedTask === "revision" || skill?.scope === "selection";
+  const usesSelection = requiresSelection || Boolean(skill && skill.scope === "either" && state.mappingId);
+  const readyForScope = !usesSelection || Boolean(state.mappingId && confirmed);
+  elements.instruction.disabled = state.selectedTask === "revision" ? !state.mappingId : !skill;
+  elements.analyze.disabled = state.skillTaskRunning ? false : !hasInstruction || !readyForScope ||
+    (state.selectedTask !== "revision" && !skill) || state.analyzing || state.pendingManualEditCount > 0 ||
+    Boolean(state.directDraft) || Boolean(state.candidateId) || isWriteInteractionBusy();
+  updateTaskUi();
+}
+
+function textBeforeBoundary(layer, boundary) {
+  let text = "";
+  for (const node of textNodesInLayer(layer)) {
+    if (node === boundary.node) {
+      text += node.textContent.slice(0, clamp(boundary.offset, 0, node.textContent.length));
+      break;
+    }
+    text += node.textContent;
+  }
+  return text;
+}
+
+function textAfterBoundary(layer, boundary) {
+  let text = "";
+  let started = false;
+  for (const node of textNodesInLayer(layer)) {
+    if (node === boundary.node) {
+      text += node.textContent.slice(clamp(boundary.offset, 0, node.textContent.length));
+      started = true;
+      continue;
+    }
+    if (started) text += node.textContent;
+  }
+  return text;
+}
+
+function buildTextPageFragments(range, startPage, endPage) {
+  const fragments = [];
+  for (let page = startPage; page <= endPage; page += 1) {
+    const record = state.pageStates[page - 1];
+    const layer = record?.textLayerElement;
+    if (!record || !layer || record.status !== "rendered") {
+      throw new Error(`第 ${page} 页文字层尚未就绪，请稍后重试跨页选择。`);
+    }
+    const pageRange = document.createRange();
+    pageRange.selectNodeContents(layer);
+    if (page === startPage) pageRange.setStart(range.startContainer, range.startOffset);
+    if (page === endPage) pageRange.setEnd(range.endContainer, range.endOffset);
+    const pageRect = record.shell.getBoundingClientRect();
+    const rawRects = [...pageRange.getClientRects()].filter((rect) =>
+      rect.width > 0 && rect.height > 0 &&
+      rect.right > pageRect.left && rect.left < pageRect.right &&
+      rect.bottom > pageRect.top && rect.top < pageRect.bottom
+    );
+    const trimMargins = startPage !== endPage;
+    const rects = rawRects.filter((rect) => {
+      if (!trimMargins) return true;
+      const centerRatio = (rect.top + rect.height / 2 - pageRect.top) / Math.max(1, pageRect.height);
+      return centerRatio >= 0.07 && centerRatio <= 0.93;
+    });
+    const text = extractSelectedLayerText(pageRange, layer, pageRect, trimMargins).trim();
+    const normalized = sampleNormalizedPageRects(normalizeTextSelectionRects(rects, pageRect), page);
+    if (!text || normalized.length === 0) continue;
+    const first = rects[0];
+    const last = rects.at(-1);
+    fragments.push({
+      page,
+      text,
+      start: textRectPoint(first, record, false),
+      end: textRectPoint(last, record, true),
+      rects: normalized
+    });
+  }
+  if (fragments.length === 0 || fragments[0].page !== startPage || fragments.at(-1).page !== endPage) {
+    throw new Error("跨页选区在起止页没有形成有效正文，请避开页眉、页脚后重试。");
+  }
+  return fragments;
+}
+
+function extractSelectedLayerText(selectionRange, layer, pageRect, trimMargins) {
+  const pieces = [];
+  const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    if (!node.textContent) continue;
+    if (!selectionRange.intersectsNode(node)) continue;
+    const nodeRange = document.createRange();
+    nodeRange.selectNodeContents(node);
+    const slice = nodeRange.cloneRange();
+    if (node === selectionRange.startContainer) {
+      slice.setStart(selectionRange.startContainer, selectionRange.startOffset);
+    }
+    if (node === selectionRange.endContainer) {
+      slice.setEnd(selectionRange.endContainer, selectionRange.endOffset);
+    }
+    const rects = [...slice.getClientRects()].filter((rect) => rect.width > 0 && rect.height > 0);
+    if (rects.length === 0) continue;
+    if (trimMargins) {
+      const centerRatio = (rects[0].top + rects[0].height / 2 - pageRect.top) / Math.max(1, pageRect.height);
+      if (centerRatio < 0.07 || centerRatio > 0.93) continue;
+    }
+    pieces.push(slice.toString());
+  }
+  return pieces.join("");
+}
+
+function textRectPoint(rect, record, useRight) {
+  const pageRect = record.shell.getBoundingClientRect();
+  const inset = Math.min(rect.width * 0.2, 3);
+  return {
+    x: clamp(((useRight ? rect.right - inset : rect.left + inset) - pageRect.left) * record.widthPt / Math.max(1, pageRect.width), 0.5, record.widthPt - 0.5),
+    y: clamp((rect.top + rect.height / 2 - pageRect.top) * record.heightPt / Math.max(1, pageRect.height), 0.5, record.heightPt - 0.5)
+  };
+}
+
+function sampleNormalizedPageRects(rects, page) {
+  const sampled = rects.length <= 64 ? rects : Array.from({ length: 64 }, (_, index) =>
+    rects[Math.round(index * (rects.length - 1) / 63)]
+  );
+  return sampled.map((rect) => ({ ...rect, page }));
+}
+
+function sampleCrossPageRects(fragments, maximum) {
+  const perPage = Math.max(1, Math.floor(maximum / Math.max(1, fragments.length)));
+  return fragments.flatMap((fragment) => {
+    const rects = fragment.rects;
+    if (rects.length <= perPage) return rects;
+    return Array.from({ length: perPage }, (_, index) =>
+      rects[Math.round(index * (rects.length - 1) / Math.max(1, perPage - 1))]
+    );
+  });
+}
+
+function applyPageMetadata(metadata) {
+  const anchor = captureViewState();
+  for (const item of metadata) {
+    const record = state.pageStates[item.number - 1];
+    if (!record) continue;
+    record.widthPt = item.widthPt;
+    record.heightPt = item.heightPt;
+    record.rotation = item.rotation;
+    updateShellSize(record);
+  }
+  requestAnimationFrame(() => restoreViewState(anchor));
 }
 
 function isWriteInteractionBusy() {
-  return Boolean(state.manualEditRequestId) || Boolean(state.rangeRequestId) || [
+  return Boolean(state.manualEditRequestId) || Boolean(state.imageQueueRequestId) || Boolean(state.rangeRequestId) || [
     "analyze",
+    "skillTask",
     "apply",
     "compile",
     "queueManualEdit",
+    "locateImage",
+    "queueImageEdit",
     "undoManualEdit",
     "redoManualEdit",
     "clearManualEdits",
@@ -1995,17 +2841,20 @@ function isWriteInteractionBusy() {
 }
 
 function manualEditUnavailableReason(allowDirectDraft = false) {
+  if (state.interactionMode !== "direct") {
+    return "请先切换到直接编辑模式。";
+  }
   if (state.manualEditMode === "direct" && state.hasTrackedRevisions) {
     return "请先接受全部或拒绝全部旧版修订痕迹。";
   }
   if (state.directDraft && !allowDirectDraft) {
     return "请先提交或取消当前直接编辑草稿。";
   }
-  if (state.selectionTool === "region" || state.selectionLabel === "区域框选") {
-    return "手动修订仅支持普通文字选区，区域框选暂不可用。";
+  if (state.imageEditDraft) {
+    return "请先确认或取消当前图片尺寸候选。";
   }
   if (!state.textSelection || !state.sessionId || !state.mappingId) {
-    return "请先在 PDF 中划选并定位普通文字。";
+    return "请先在 PDF 中划选并定位文字。";
   }
   if (state.requiresConfirmation && !state.rangeConfirmed) {
     return "请先确认当前选区对应的源码范围。";
@@ -2027,13 +2876,14 @@ function updateManualEditAvailability() {
   const pendingCount = state.pendingManualEditCount;
 
   elements.manualText.disabled = baseDisabled;
-  elements.manualText.placeholder = state.selectionTool === "region" || state.selectionLabel === "区域框选"
-    ? "区域框选不支持手动增删改，请使用普通文字选区。"
+  const regionEdit = state.selectionLabel === "区域框选";
+  elements.manualText.placeholder = regionEdit
+    ? "输入替换整个区域的文字；留空时可删除。"
     : state.mappingId
       ? "输入需要新增或替换的文字。"
       : "请先在 PDF 中划选普通文字。";
-  elements.manualInsertBefore.disabled = baseDisabled || !hasText;
-  elements.manualInsertAfter.disabled = baseDisabled || !hasText;
+  elements.manualInsertBefore.disabled = baseDisabled || !hasText || regionEdit;
+  elements.manualInsertAfter.disabled = baseDisabled || !hasText || regionEdit;
   elements.manualReplace.disabled = baseDisabled || !hasText;
   elements.manualDelete.disabled = baseDisabled;
   for (const button of [
@@ -2063,6 +2913,8 @@ function updateManualEditAvailability() {
   elements.compile.disabled = historyBusy || Boolean(state.directDraft);
   elements.regionSelect.disabled = historyBusy;
   elements.directEdit.disabled = historyBusy;
+  elements.modeDirect.disabled = historyBusy;
+  elements.modeAgent.disabled = historyBusy;
   elements.manualHandoff.disabled = pendingBlocksAi || historyBusy;
   elements.adjustRange.disabled = !state.mappingId || Boolean(state.rangeRequestId) || historyBusy;
   elements.apply.disabled = pendingBlocksAi || state.busyAction === "apply" || state.busyAction === "compile";
@@ -2073,8 +2925,9 @@ function updateManualEditAvailability() {
 }
 
 function normalizePendingEdit(raw) {
+  const imageEdit = raw?.editType === "image" && raw?.kind === "imageResize";
   if (!raw || typeof raw !== "object" || typeof raw.id !== "string" ||
-      !["insertBefore", "insertAfter", "replace", "delete"].includes(raw.kind)) {
+      (!imageEdit && !["insertBefore", "insertAfter", "replace", "delete"].includes(raw.kind))) {
     return undefined;
   }
   const page = positivePage(raw.page);
@@ -2089,17 +2942,25 @@ function normalizePendingEdit(raw) {
     const y = clamp(rect.y, 0, 1);
     const width = clamp(rect.width, 0, 1 - x);
     const height = clamp(rect.height, 0, 1 - y);
-    return width > 0 && height > 0 ? { x, y, width, height } : undefined;
+    const rectPage = positivePage(rect.page) ?? page;
+    return width > 0 && height > 0 ? { page: rectPage, x, y, width, height } : undefined;
   }).filter(Boolean);
   if (rects.length === 0) {
     return undefined;
   }
   return {
+    ...(imageEdit ? { editType: "image" } : {}),
     id: raw.id,
     kind: raw.kind,
     page,
     rects,
-    insertedText: typeof raw.insertedText === "string" ? raw.insertedText : ""
+    insertedText: typeof raw.insertedText === "string" ? raw.insertedText : "",
+    ...(imageEdit ? {
+      imagePath: typeof raw.imagePath === "string" ? raw.imagePath : "",
+      originalValue: typeof raw.originalValue === "string" ? raw.originalValue : "原尺寸",
+      candidateValue: typeof raw.candidateValue === "string" ? raw.candidateValue : "候选尺寸",
+      factor: Number.isFinite(raw.factor) ? raw.factor : 1
+    } : {})
   };
 }
 
@@ -2178,7 +3039,7 @@ function setDirectDraftDeletion(direction) {
   }
   let rects = draft.selectionRects;
   let caretDeleteDirection;
-  if (draft.caretVisibleOffset !== undefined) {
+  if (draft.selectionKind !== "region" && draft.caretVisibleOffset !== undefined) {
     rects = direction === "backward" ? draft.backwardRects : draft.forwardRects;
     if (rects.length === 0) {
       setStatus(direction === "backward" ? "光标前没有可删除文字。" : "光标后没有可删除文字。", "warning");
@@ -2191,10 +3052,8 @@ function setDirectDraftDeletion(direction) {
   draft.rects = rects;
   draft.caretDeleteDirection = caretDeleteDirection;
   elements.directInput.value = "";
-  const record = state.pageStates[draft.page - 1];
-  if (record) {
-    renderDirectDraft(record, true);
-  }
+  const focusPage = Math.max(...draft.rects.map((rect) => rect.page ?? draft.page));
+  renderAllDirectDraftOverlays(focusPage);
   setStatus(
     draft.caretVisibleOffset !== undefined
       ? "将删除光标旁的一个字素；批量删除请先拖选文字。按 Ctrl+Enter 提交。"
@@ -2266,8 +3125,87 @@ function updateAssistantName(value) {
     ? value
     : "AI 助手";
   state.assistantName = name;
-  elements.analyze.textContent = `交给 ${name} 分析`;
+  updateTaskUi();
   elements.manualHandoff.textContent = `复制任务并打开 ${name}`;
+}
+
+function selectedSkill() {
+  return state.skills.find((skill) => `skill:${skill.id}` === state.selectedTask);
+}
+
+function updateTaskUi() {
+  const skill = selectedSkill();
+  if (state.skillTaskRunning) {
+    elements.analyze.textContent = "取消 Skill 任务";
+    elements.taskMode.disabled = true;
+    return;
+  }
+  elements.taskMode.disabled = false;
+  if (!skill) {
+    elements.analyze.textContent = `交给 ${state.assistantName} 分析`;
+    elements.taskScopeNote.textContent = "需要 PDF 选区";
+    elements.instruction.placeholder = state.mappingId ? "输入对所选内容的修改要求。" : "先在 PDF 中划选内容，再输入修改要求。";
+    return;
+  }
+  elements.analyze.textContent = `交给 ${state.assistantName} 执行`;
+  elements.taskScopeNote.textContent = skill.scope === "document"
+    ? "整篇论文"
+    : skill.scope === "selection"
+      ? "需要 PDF 选区"
+      : state.mappingId ? "将使用当前选区" : "整篇论文";
+  elements.instruction.placeholder = `输入交给 ${skill.name} 的任务要求。`;
+}
+
+function updateSkills(skills) {
+  const previous = state.selectedTask;
+  state.skills = Array.isArray(skills) ? skills.filter((skill) =>
+    skill && typeof skill.id === "string" && typeof skill.name === "string" &&
+    ["document", "selection", "either"].includes(skill.scope)
+  ) : [];
+  elements.taskMode.replaceChildren();
+  const revision = document.createElement("option");
+  revision.value = "revision";
+  revision.textContent = "局部修订";
+  elements.taskMode.append(revision);
+  for (const skill of state.skills) {
+    const option = document.createElement("option");
+    option.value = `skill:${skill.id}`;
+    option.textContent = `Skill：${skill.name}`;
+    elements.taskMode.append(option);
+  }
+  state.selectedTask = [...elements.taskMode.options].some((option) => option.value === previous) ? previous : "revision";
+  elements.taskMode.value = state.selectedTask;
+  updateAnalyzeAvailability();
+}
+
+function clearSkillArtifacts() {
+  elements.skillArtifacts.replaceChildren();
+  elements.skillArtifacts.hidden = true;
+}
+
+function showSkillArtifacts(message) {
+  clearSkillArtifacts();
+  const title = document.createElement("div");
+  title.className = "skill-artifacts-title";
+  title.textContent = message.summary || "Skill 任务已完成";
+  elements.skillArtifacts.append(title);
+  for (const artifact of Array.isArray(message.artifacts) ? message.artifacts : []) {
+    const row = document.createElement("div");
+    row.className = "skill-artifact-row";
+    const text = document.createElement("span");
+    text.textContent = `${artifact.name} · ${artifact.description || artifact.type || "产物"}`;
+    const open = document.createElement("button");
+    open.className = "secondary-button";
+    open.textContent = "打开";
+    open.addEventListener("click", () => post("openSkillArtifact", { index: artifact.index, action: "open" }));
+    const reveal = document.createElement("button");
+    reveal.className = "secondary-button";
+    reveal.textContent = "显示位置";
+    reveal.addEventListener("click", () => post("openSkillArtifact", { index: artifact.index, action: "reveal" }));
+    row.append(text, open, reveal);
+    elements.skillArtifacts.append(row);
+  }
+  elements.skillArtifacts.hidden = false;
 }
 
 function setStatus(message, kind = "ready") {
@@ -2338,6 +3276,9 @@ function handleBusy(message) {
 }
 
 function handleMapping(message) {
+  if (Number.isInteger(message.interactionVersion) && message.interactionVersion !== state.interactionVersion) {
+    return;
+  }
   const initialMapping = message.requestId === state.selectionRequestId &&
     (!state.sessionId || message.sessionId === state.sessionId);
   const adjustedMapping = message.requestId === state.rangeRequestId && message.sessionId === state.sessionId;
@@ -2363,7 +3304,10 @@ function handleMapping(message) {
     state.selectionLabel = "区域框选";
   }
   elements.selectionDetails.hidden = false;
-  elements.selectionSummary.textContent = `第 ${message.page} 页 · ${state.selectionLabel} · ${message.selectionLength} 字`;
+  const mappedPageLabel = Number(message.endPage) > Number(message.page)
+    ? `${message.page}--${message.endPage}`
+    : message.page;
+  elements.selectionSummary.textContent = `第 ${mappedPageLabel} 页 · ${state.selectionLabel} · ${message.selectionLength} 字`;
   elements.sourceDetails.hidden = false;
   elements.sourceDetails.dataset.kind = state.requiresConfirmation ? "warning" : "ready";
   elements.sourceSummary.textContent = `main.tex 第 ${message.startLine}--${message.endLine} 行${state.requiresConfirmation ? " · 需要核对" : ""}`;
@@ -2388,7 +3332,9 @@ function handleMapping(message) {
         ? "直接编辑位置已定位，但需要先确认源码范围。"
         : "直接编辑位置已定位，按 Ctrl+Enter 提交。"
       : state.selectionLabel === "区域框选"
-      ? `${message.confidenceNote ? `${message.confidenceNote} ` : ""}区域框选可用于 AI 分析，但不支持手动增删改。`
+      ? state.interactionMode === "direct"
+        ? `${message.confidenceNote ? `${message.confidenceNote} ` : ""}区域已定位，可替换或删除整个区域。`
+        : `${message.confidenceNote ? `${message.confidenceNote} ` : ""}区域框选可用于 Agent 分析。`
       : message.confidenceNote || "选区已定位，可输入修改要求。",
     message.confidenceNote ? "warning" : "ready"
   );
@@ -2406,19 +3352,25 @@ function isCurrentIdentity(message) {
 
 elements.viewer.addEventListener("scroll", scheduleVisibleUpdate, { passive: true });
 elements.pages.addEventListener("pointerdown", beginRegionDraft);
+elements.pages.addEventListener("pointerdown", beginTextSelectionDrag);
 elements.pages.addEventListener("pointermove", moveRegionDraft);
+elements.pages.addEventListener("pointermove", moveTextSelectionDrag);
 elements.pages.addEventListener("pointerup", finishRegionDraft);
 elements.pages.addEventListener("pointercancel", (event) => {
   if (state.regionDraft?.pointerId === event.pointerId) {
     cancelRegionDraft();
     setStatus("区域框选已取消。", "ready");
   }
+  finishTextSelectionDrag();
 });
 function scheduleSelectionCaptureFromEvent(event) {
   if (event.target?.closest?.("input, textarea, button, .direct-edit-draft-overlay")) {
     return;
   }
-  setTimeout(captureSelection, 0);
+  setTimeout(() => {
+    captureSelection();
+    finishTextSelectionDrag();
+  }, 0);
 }
 elements.pages.addEventListener("mouseup", scheduleSelectionCaptureFromEvent);
 elements.pages.addEventListener("keyup", scheduleSelectionCaptureFromEvent);
@@ -2451,8 +3403,10 @@ elements.pageNumber.addEventListener("change", () => {
 elements.zoomOut.addEventListener("click", () => void setScale(state.scale - 0.15, captureScaleAnchor(), false));
 elements.zoomIn.addEventListener("click", () => void setScale(state.scale + 0.15, captureScaleAnchor(), false));
 elements.fitWidth.addEventListener("click", () => void setScale(computeFitScale(), captureScaleAnchor(), true));
-elements.directEdit.addEventListener("click", () => setDirectEditEnabled(!state.directEditEnabled));
-elements.regionSelect.addEventListener("click", () => setSelectionTool(state.selectionTool === "region" ? "text" : "region"));
+elements.modeDirect.addEventListener("click", () => setInteractionMode("direct"));
+elements.modeAgent.addEventListener("click", () => setInteractionMode("agent"));
+elements.directEdit.addEventListener("click", () => setSelectionTool("text"));
+elements.regionSelect.addEventListener("click", () => setSelectionTool("region"));
 elements.clearSelection.addEventListener("click", () => {
   if (isWriteInteractionBusy()) return;
   clearLocalSession(true);
@@ -2466,6 +3420,12 @@ elements.compile.addEventListener("click", () => {
   post("compile", { queueVersion: state.manualEditQueueVersion });
 });
 elements.instruction.addEventListener("input", updateAnalyzeAvailability);
+elements.taskMode.addEventListener("change", () => {
+  if (state.skillTaskRunning) return;
+  state.selectedTask = elements.taskMode.value;
+  clearSkillArtifacts();
+  updateAnalyzeAvailability();
+});
 elements.manualText.addEventListener("input", updateManualEditAvailability);
 elements.directInput.addEventListener("compositionstart", () => {
   state.directInputComposing = true;
@@ -2594,7 +3554,29 @@ elements.confirmRange.addEventListener("click", () => {
   });
 });
 elements.analyze.addEventListener("click", () => {
-  if (!state.sessionId || !state.mappingId || state.pendingManualEditCount > 0) return;
+  if (state.skillTaskRunning) {
+    post("cancelSkillTask");
+    setStatus("正在取消 Skill 任务……", "busy");
+    return;
+  }
+  if (state.pendingManualEditCount > 0) return;
+  const skill = selectedSkill();
+  if (skill) {
+    const useSelection = skill.scope === "selection" || (skill.scope === "either" && Boolean(state.mappingId));
+    if (useSelection && (!state.sessionId || !state.mappingId)) return;
+    state.skillTaskRunning = true;
+    state.busyAction = "skillTask";
+    clearSkillArtifacts();
+    updateAnalyzeAvailability();
+    updateManualEditAvailability();
+    post("runSkillTask", {
+      skillId: skill.id,
+      instruction: elements.instruction.value,
+      useSelection
+    });
+    return;
+  }
+  if (!state.sessionId || !state.mappingId) return;
   state.analyzing = true;
   state.busyAction = "analyze";
   updateAnalyzeAvailability();
@@ -2648,7 +3630,7 @@ function isEditableKeyboardTarget(target) {
 
 window.addEventListener("keydown", (event) => {
   const modifier = event.ctrlKey || event.metaKey;
-  if (state.directEditEnabled && modifier && !event.altKey && !isEditableKeyboardTarget(event.target)) {
+  if (state.interactionMode === "direct" && modifier && !event.altKey && !isEditableKeyboardTarget(event.target)) {
     const key = event.key.toLowerCase();
     if (key === "y" || (key === "z" && event.shiftKey)) {
       event.preventDefault();
@@ -2662,6 +3644,9 @@ window.addEventListener("keydown", (event) => {
     }
   }
   if (event.key !== "Escape" || event.target?.matches?.("input, textarea")) {
+    return;
+  }
+  if (cancelImageEditDraft()) {
     return;
   }
   if (cancelDirectDraft()) {
@@ -2684,6 +3669,56 @@ window.addEventListener("message", async (event) => {
     return;
   }
   switch (message.type) {
+    case "skillsChanged":
+      updateSkills(message.skills);
+      break;
+    case "skillTaskStarted":
+      state.skillTaskRunning = true;
+      state.busyAction = "skillTask";
+      elements.compile.disabled = true;
+      clearSkillArtifacts();
+      updateCompileProgress({ percent: 2, message: message.message, indeterminate: false });
+      updateAnalyzeAvailability();
+      updateManualEditAvailability();
+      setStatus(message.message, "busy");
+      break;
+    case "skillTaskProgress":
+      updateCompileProgress(message);
+      setStatus(message.message, "busy");
+      break;
+    case "skillTaskCancelling":
+      setStatus(message.message, "busy");
+      break;
+    case "skillTaskCompleted": {
+      state.skillTaskRunning = false;
+      state.busyAction = undefined;
+      elements.compile.disabled = false;
+      finishCompileProgress("Skill 任务完成");
+      showSkillArtifacts(message);
+      updateAnalyzeAvailability();
+      updateManualEditAvailability();
+      const warningCount = Array.isArray(message.warnings) ? message.warnings.length : 0;
+      setStatus(warningCount ? `Skill 任务完成，包含 ${warningCount} 项提示。` : "Skill 任务完成，产物已列出。", warningCount ? "warning" : "ready");
+      break;
+    }
+    case "skillTaskCancelled":
+      state.skillTaskRunning = false;
+      state.busyAction = undefined;
+      elements.compile.disabled = false;
+      finishCompileProgress("Skill 任务已取消", "error");
+      updateAnalyzeAvailability();
+      updateManualEditAvailability();
+      setStatus(message.message || "Skill 任务已取消。", "ready");
+      break;
+    case "skillTaskFailed":
+      state.skillTaskRunning = false;
+      state.busyAction = undefined;
+      elements.compile.disabled = false;
+      finishCompileProgress("Skill 任务失败", "error");
+      updateAnalyzeAvailability();
+      updateManualEditAvailability();
+      setStatus(message.message || "Skill 任务失败。", "error");
+      break;
     case "compileProgress":
       updateCompileProgress(message);
       break;
@@ -2747,6 +3782,57 @@ window.addEventListener("message", async (event) => {
         updateManualEditAvailability();
       }
       break;
+    case "imageEditTarget": {
+      if (message.requestId !== state.imageLocateRequestId) break;
+      state.imageLocateRequestId = undefined;
+      state.busyAction = undefined;
+      const page = positivePage(message.page);
+      const rects = Array.isArray(message.rects) ? message.rects.map((rect) => ({ ...rect })).filter((rect) =>
+        Number.isFinite(rect.x) && Number.isFinite(rect.y) && Number.isFinite(rect.width) && Number.isFinite(rect.height)
+      ) : [];
+      if (!page || rects.length === 0 || typeof message.targetId !== "string") {
+        setStatus("后端返回的图片定位数据无效，请重试。", "error");
+        break;
+      }
+      state.imageEditDraft = {
+        targetId: message.targetId,
+        page,
+        rects,
+        imagePath: typeof message.imagePath === "string" ? message.imagePath : "",
+        originalValue: typeof message.originalValue === "string" ? message.originalValue : "原尺寸",
+        roughBounds: message.roughBounds,
+        snappedBounds: message.snappedBounds,
+        pageWidth: message.pageWidth,
+        pageHeight: message.pageHeight,
+        factor: 1
+      };
+      clearRegionSelection();
+      renderImageEditDraft();
+      updateManualEditAvailability();
+      updateClearSelectionAvailability();
+      setStatus("图片已定位。使用上下箭头调整候选尺寸，确认后再点击编译。", "ready");
+      break;
+    }
+    case "imageEditQueued": {
+      if (message.requestId !== state.imageQueueRequestId) break;
+      const edit = normalizePendingEdit(message.edit);
+      updateManualEditQueueVersion(message.queueVersion);
+      state.imageQueueRequestId = undefined;
+      state.busyAction = undefined;
+      if (!edit) {
+        updateManualEditAvailability();
+        setStatus("后端返回的图片调整数据无效，请重试。", "error");
+        break;
+      }
+      const edits = state.pendingManualEdits.filter((item) => item.id !== edit.id);
+      edits.push(edit);
+      setPendingManualEdits(edits, message.count, message);
+      clearImageEditDraft();
+      clearRegionSelection();
+      updateClearSelectionAvailability();
+      setStatus(`图片尺寸调整已暂存，共 ${state.pendingManualEditCount} 项待编译。`, "ready");
+      break;
+    }
     case "manualEditQueued": {
       if (message.requestId && message.requestId !== state.manualEditRequestId) break;
       const directQueued = message.requestId && message.requestId === state.directQueueRequestId;
@@ -2862,6 +3948,10 @@ window.addEventListener("message", async (event) => {
       elements.apply.disabled = false;
       const warningCount = Array.isArray(message.warnings) ? message.warnings.length : 0;
       try {
+        activePdfFingerprint = message.pdfFingerprint || activePdfFingerprint;
+        activePreviewKey = message.previewKey || activePreviewKey;
+        state.cachedPreviewSignature = undefined;
+        config.preview = undefined;
         await loadPdf({ preservePosition: true });
         finishCompileProgress("编译完成，PDF 已刷新");
         updateManualEditAvailability();
@@ -2880,6 +3970,8 @@ window.addEventListener("message", async (event) => {
       setStatus(message.message, "ready");
       break;
     case "error":
+      if (message.action === "locateImage" && message.requestId !== state.imageLocateRequestId) break;
+      if (message.action === "queueImageEdit" && message.requestId !== state.imageQueueRequestId) break;
       if (message.action === "queueManualEdit" && message.requestId && message.requestId !== state.manualEditRequestId) break;
       if (message.action === "adjustRange" && message.requestId !== state.rangeRequestId) break;
       if (!["queueManualEdit", "adjustRange"].includes(message.action) && message.sessionId && message.sessionId !== state.sessionId) break;
@@ -2902,12 +3994,27 @@ window.addEventListener("message", async (event) => {
           state.directDraft.mapped = false;
         }
       }
+      if (message.action === "locateImage") {
+        state.imageLocateRequestId = undefined;
+        clearImageEditDraft();
+        clearRegionSelection();
+      }
+      if (message.action === "queueImageEdit") {
+        state.imageQueueRequestId = undefined;
+      }
+      if (message.action === "runSkillTask") {
+        state.skillTaskRunning = false;
+        elements.compile.disabled = false;
+      }
       state.analyzing = false;
       if (!message.action || message.action === state.busyAction || [
         "analyze",
+        "runSkillTask",
         "apply",
         "compile",
         "queueManualEdit",
+        "locateImage",
+        "queueImageEdit",
         "undoManualEdit",
         "redoManualEdit",
         "clearManualEdits",
@@ -2919,7 +4026,7 @@ window.addEventListener("message", async (event) => {
       elements.compile.disabled = false;
       elements.apply.disabled = false;
       if (message.action === "compile" || state.compileProgressActive) {
-        finishCompileProgress("编译失败，请查看错误信息", "error");
+        finishCompileProgress(message.action === "runSkillTask" ? "Skill 任务未启动" : "编译失败，请查看错误信息", "error");
       }
       updateAnalyzeAvailability();
       updateManualEditAvailability();

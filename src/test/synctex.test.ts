@@ -1,6 +1,24 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { chooseSyncTexSpatialCandidate, hasMonotonicSourceOrder } from "../synctex";
+import { chooseSyncTexSpatialCandidate, hasMonotonicSourceOrder, selectionLocations } from "../synctex";
+
+describe("跨页文字选区的 SyncTeX 位置", () => {
+  it("为每个分页片段保留独立页码和起止点", () => {
+    const locations = selectionLocations({
+      kind: "text",
+      text: "第一页第二页",
+      page: 7,
+      start: { x: 10, y: 700 },
+      end: { x: 20, y: 100 },
+      pageFragments: [
+        { page: 7, text: "第一页", start: { x: 10, y: 700 }, end: { x: 500, y: 760 } },
+        { page: 8, text: "第二页", start: { x: 40, y: 80 }, end: { x: 20, y: 100 } }
+      ]
+    });
+    assert.deepEqual(locations.map((location) => location.page), [7, 7, 8, 8]);
+    assert.deepEqual(locations[2].point, { x: 40, y: 80 });
+  });
+});
 
 describe("区域锚点源码顺序", () => {
   it("接受相同或递增的源码行", () => {

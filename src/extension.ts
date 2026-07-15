@@ -8,6 +8,17 @@ import { clearExecutableCache } from "./processRunner";
 import { chooseProjectRoot, isFile, projectPaths, resolveProject } from "./project";
 import { ReviewPanel } from "./reviewPanel";
 import { CircleTexSettingsProvider } from "./settingsView";
+import { SkillRegistry } from "./skillRegistry";
+import { SkillTaskService } from "./skillTask";
+import {
+  chooseSkillDirectory,
+  CircleTexSkillProvider,
+  configureAndConfirmSkill,
+  showSkillDetails,
+  showSkillHistory,
+  sourceDirectoryUri
+} from "./skillView";
+import { ImportedSkill } from "./skillTypes";
 import { CircleTexStartProvider } from "./startView";
 import { ProjectPaths } from "./types";
 
@@ -19,13 +30,33 @@ export function activate(context: vscode.ExtensionContext): void {
   const previewProvider = new PreviewContentProvider();
   const startProvider = new CircleTexStartProvider();
   const settingsProvider = new CircleTexSettingsProvider();
+  const skillRegistry = new SkillRegistry(path.join(context.globalStorageUri.fsPath, "skill-registry"));
+  const skillTaskService = new SkillTaskService(skillRegistry);
+  const skillProvider = new CircleTexSkillProvider(skillRegistry);
+  let activePanel: ReviewPanel | undefined;
+  let skillInitializationError: unknown;
+  const skillReady = skillRegistry.initialize().then(
+    () => {
+      skillProvider.refresh();
+      activePanel?.updateSkills();
+    },
+    (error) => {
+      skillInitializationError = error;
+      output.appendLine(`[Skill] 初始化失败：${errorMessage(error)}`);
+    }
+  );
+  const skillsAvailable = async (): Promise<boolean> => {
+    await skillReady;
+    if (!skillInitializationError) return true;
+    void vscode.window.showErrorMessage(`CircleTeX Skill 管理器不可用：${errorMessage(skillInitializationError)}`);
+    return false;
+  };
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBar.name = "CircleTeX";
   statusBar.text = "$(book) CircleTeX";
   statusBar.tooltip = "打开 CircleTeX PDF 论文审阅";
   statusBar.command = "circletex.openPdfReview";
   statusBar.show();
-  let activePanel: ReviewPanel | undefined;
   void resolveProject(context).then((project) => {
     settingsProvider.setResource(project ? projectResource(project) : undefined);
   }, () => undefined);
@@ -36,6 +67,7 @@ export function activate(context: vscode.ExtensionContext): void {
     previewProvider,
     vscode.window.createTreeView("circletex.start", { treeDataProvider: startProvider }),
     vscode.window.createTreeView("circletex.settings", { treeDataProvider: settingsProvider }),
+    vscode.window.createTreeView("circletex.skills", { treeDataProvider: skillProvider }),
     vscode.workspace.registerTextDocumentContentProvider("circletex-preview", previewProvider),
     vscode.commands.registerCommand("circletex.selectAssistant", async () => {
       const current = selectedAssistantId();
@@ -106,6 +138,77 @@ export function activate(context: vscode.ExtensionContext): void {
       );
     }),
     vscode.commands.registerCommand("circletex.showOutput", () => output.show()),
+    vscode.commands.registerCommand("circletex.importSkill", async () => {
+      if (!(await skillsAvailable())) return;
+      const source = await chooseSkillDirectory();
+      if (!source) return;
+      try {
+        const inspection = await skillRegistry.inspect(source);
+        const existing = skillRegistry.get(inspection.id);
+        const permissions = await configureAndConfirmSkill(inspection, existing?.permissions, existing);
+        if (!permissions) return;
+        const imported = await skillRegistry.import(inspection, permissions);
+        skillProvider.refresh();
+        activePanel?.updateSkills();
+        void vscode.window.showInformationMessage(`CircleTeX 已导入 Skill：${imported.displayName}`);
+      } catch (error) {
+        void vscode.window.showErrorMessage(`CircleTeX：${errorMessage(error)}`);
+      }
+    }),
+    vscode.commands.registerCommand("circletex.updateSkill", async (value?: ImportedSkill) => {
+      if (!(await skillsAvailable())) return;
+      const skill = await resolveSkillArgument(skillRegistry, value);
+      if (!skill) return;
+      const source = await chooseSkillDirectory(sourceDirectoryUri(skill));
+      if (!source) return;
+      try {
+        const inspection = await skillRegistry.inspect(source);
+        if (inspection.id !== skill.id) {
+          throw new Error(`所选 Skill 标识为 ${inspection.id}，与待更新的 ${skill.id} 不一致。`);
+        }
+        const permissions = await configureAndConfirmSkill(inspection, skill.permissions, skill);
+        if (!permissions) return;
+        const updated = await skillRegistry.import(inspection, permissions);
+        skillProvider.refresh();
+        activePanel?.updateSkills();
+        void vscode.window.showInformationMessage(`CircleTeX 已更新 Skill：${updated.displayName}`);
+      } catch (error) {
+        void vscode.window.showErrorMessage(`CircleTeX：${errorMessage(error)}`);
+      }
+    }),
+    vscode.commands.registerCommand("circletex.toggleSkill", async (value?: ImportedSkill) => {
+      if (!(await skillsAvailable())) return;
+      const skill = await resolveSkillArgument(skillRegistry, value);
+      if (!skill) return;
+      await skillRegistry.setEnabled(skill.id, !skill.enabled);
+      skillProvider.refresh();
+      activePanel?.updateSkills();
+      vscode.window.setStatusBarMessage(`CircleTeX 已${skill.enabled ? "停用" : "启用"} ${skill.displayName}`, 4_000);
+    }),
+    vscode.commands.registerCommand("circletex.removeSkill", async (value?: ImportedSkill) => {
+      if (!(await skillsAvailable())) return;
+      const skill = await resolveSkillArgument(skillRegistry, value);
+      if (!skill) return;
+      const action = await vscode.window.showWarningMessage(
+        `确认从 CircleTeX 移除 Skill“${skill.displayName}”？`,
+        { modal: true, detail: "将删除 CircleTeX 管理的 Skill 快照；原始外部目录和已有任务产物不受影响。" },
+        "确认移除"
+      );
+      if (action !== "确认移除") return;
+      await skillRegistry.remove(skill.id);
+      skillProvider.refresh();
+      activePanel?.updateSkills();
+    }),
+    vscode.commands.registerCommand("circletex.showSkillDetails", async (value?: ImportedSkill) => {
+      if (!(await skillsAvailable())) return;
+      const skill = await resolveSkillArgument(skillRegistry, value);
+      if (skill) await showSkillDetails(skill);
+    }),
+    vscode.commands.registerCommand("circletex.showSkillHistory", async (value?: ImportedSkill) => {
+      if (!(await skillsAvailable())) return;
+      const skill = value && typeof value.id === "string" ? skillRegistry.get(value.id) : undefined;
+      await showSkillHistory(skillRegistry, skill?.id);
+    }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration("circletex.aiAssistant")) {
         settingsProvider.refresh();
@@ -149,6 +252,7 @@ export function activate(context: vscode.ExtensionContext): void {
       void vscode.window.showInformationMessage(`CircleTeX 已关联论文项目：${root}`);
     }),
     vscode.commands.registerCommand("circletex.openPdfReview", async () => {
+      const openStartedAt = Date.now();
       if (!vscode.workspace.isTrusted) {
         void vscode.window.showErrorMessage("当前工作区不受信任，CircleTeX 不会打开本地论文或运行工具。");
         return;
@@ -175,7 +279,16 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
       activePanel?.close();
-      activePanel = new ReviewPanel(context, project, output, compiler, previewProvider);
+      activePanel = new ReviewPanel(
+        context,
+        project,
+        output,
+        compiler,
+        previewProvider,
+        skillRegistry,
+        skillTaskService
+      );
+      output.appendLine(`[耗时] PDF 审阅窗口创建：${((Date.now() - openStartedAt) / 1_000).toFixed(2)} 秒。`);
       context.subscriptions.push(activePanel);
     }),
     vscode.commands.registerCommand("circletex.compileDocument", async () => {
@@ -195,6 +308,31 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     })
   );
+}
+
+async function resolveSkillArgument(registry: SkillRegistry, value?: ImportedSkill): Promise<ImportedSkill | undefined> {
+  if (value && typeof value.id === "string") {
+    return registry.get(value.id);
+  }
+  const skills = registry.list();
+  if (skills.length === 0) {
+    void vscode.window.showErrorMessage("CircleTeX：尚未导入外部 Skill。");
+    return undefined;
+  }
+  const selected = await vscode.window.showQuickPick(
+    skills.map((skill) => ({
+      label: skill.displayName,
+      description: skill.enabled ? "已启用" : "已停用",
+      detail: skill.description,
+      skill
+    })),
+    { title: "CircleTeX：选择 Skill", placeHolder: "选择要操作的 Skill" }
+  );
+  return selected?.skill;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function samePath(left: string, right: string): boolean {

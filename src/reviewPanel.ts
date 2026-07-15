@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
@@ -12,23 +13,41 @@ import {
 import { createSelectedAssistant, openAssistantSidebar, selectedAssistantId } from "./assistant";
 import { AssistantId, assistantLabel, AssistantUnavailableError } from "./assistantTypes";
 import { CompileProgress, CompilePublishValidator, CompileResult, LatexCompiler } from "./compiler";
+import {
+  applyDirectDocumentEdits,
+  isPendingImageEdit,
+  PendingDocumentEdit,
+  validateNoOverlappingDocumentEdits
+} from "./documentEdits";
 import { isFile } from "./fsUtils";
 import {
+  chooseImageCandidatesByMappedLines,
+  createImageEditTarget,
+  createPendingImageEdit,
+  findImageEditCandidates,
+  formatImageCandidateValue,
+  ImageEditTarget,
+  validateImageSelectionConsistency
+} from "./imageEditResolver";
+import {
   acceptAllCircleTeXRevisions,
-  applyDirectManualEdits,
   applyManualEdits,
   createPendingCaretManualEdit,
   createPendingManualEdit,
   hasCircleTeXRevisions,
+  ManualEditCaretAmbiguityError,
   ManualEditKind,
   ManualEditAmbiguityError,
   NormalizedManualEditRect,
   PendingManualEdit,
   rejectAllCircleTeXRevisions,
-  validateNoOverlappingManualEdits
 } from "./manualEdits";
 import { PreviewContentProvider } from "./previewProvider";
-import { parsePdfSelectionPayload } from "./selectionPayload";
+import { RegionEditAmbiguityError } from "./regionEditResolver";
+import { parsePdfImageSelectionPayload, parsePdfSelectionPayload } from "./selectionPayload";
+import { SkillRegistry } from "./skillRegistry";
+import { SkillTaskService } from "./skillTask";
+import { ImportedSkill, SkillTaskResult } from "./skillTypes";
 import { buildSourceMapping, SyncTexLocator } from "./synctex";
 import { computeLineStarts } from "./textRange";
 import { ProjectPaths, RevisionCandidate, SourceMapping } from "./types";
@@ -43,8 +62,10 @@ export class ReviewPanel implements vscode.Disposable {
   private candidate?: RevisionCandidate;
   private previewUri?: vscode.Uri;
   private manualPreviewUri?: vscode.Uri;
-  private readonly pendingManualEdits: PendingManualEdit[] = [];
-  private readonly redoManualEdits: PendingManualEdit[] = [];
+  private readonly pendingManualEdits: PendingDocumentEdit[] = [];
+  private readonly redoManualEdits: PendingDocumentEdit[] = [];
+  private imageEditTarget?: ImageEditTarget;
+  private imageSelectionSequence = 0;
   private pendingManualEditMode?: ManualEditMode;
   private manualQueueVersion = 0;
   private manualTask?: string;
@@ -59,6 +80,8 @@ export class ReviewPanel implements vscode.Disposable {
   private rangeSequence = 0;
   private analysisSequence = 0;
   private activeAnalysisId?: number;
+  private activeSkillTask?: { controller: AbortController; skillId: string };
+  private lastSkillResult?: SkillTaskResult;
   private applying = false;
   private disposed = false;
 
@@ -67,7 +90,9 @@ export class ReviewPanel implements vscode.Disposable {
     private readonly project: ProjectPaths,
     private readonly output: vscode.OutputChannel,
     private readonly compiler: LatexCompiler,
-    private readonly previewProvider: PreviewContentProvider
+    private readonly previewProvider: PreviewContentProvider,
+    private readonly skillRegistry: SkillRegistry,
+    private readonly skillTaskService: SkillTaskService
   ) {
     this.panel = vscode.window.createWebviewPanel(
       "circletex.pdfReview",
@@ -78,7 +103,8 @@ export class ReviewPanel implements vscode.Disposable {
         retainContextWhenHidden: true,
         localResourceRoots: [
           vscode.Uri.joinPath(context.extensionUri, "media"),
-          vscode.Uri.file(path.dirname(project.pdf))
+          vscode.Uri.file(path.dirname(project.pdf)),
+          vscode.Uri.joinPath(context.globalStorageUri, "pdf-previews")
         ]
       }
     );
@@ -135,8 +161,16 @@ export class ReviewPanel implements vscode.Disposable {
     this.sendManualEditsState();
   }
 
+  public updateSkills(): void {
+    this.post({ type: "skillsChanged", skills: skillsForWebview(this.skillRegistry.list()) });
+  }
+
   public async compileAndRefresh(fromApply = false): Promise<void> {
     this.requireTrustedWorkspace();
+    if (this.activeSkillTask) {
+      this.post({ type: "notice", message: "Skill 任务正在使用论文输入快照，请等待任务完成或先取消任务。无需为 Skill 任务编译论文。" });
+      return;
+    }
     if (this.applying && !fromApply) {
       throw new Error("正在应用修订，暂时不能启动编译。");
     }
@@ -157,7 +191,7 @@ export class ReviewPanel implements vscode.Disposable {
       await this.ensureSourceSaved();
       this.invalidateRevisionSession();
       const result = await this.runCompileCore(() => this.ensureSourceSaved());
-      this.post({ type: "compiled", token: Date.now(), warnings: result.warnings });
+      this.postCompiled(result.warnings);
       await this.sendTrackedRevisionState();
     } catch (error) {
       const message = errorMessage(error);
@@ -194,6 +228,8 @@ export class ReviewPanel implements vscode.Disposable {
     }
     this.disposed = true;
     this.analysisSequence += 1;
+    this.activeSkillTask?.controller.abort();
+    this.activeSkillTask = undefined;
     if (this.previewUri) {
       this.previewProvider.delete(this.previewUri);
     }
@@ -211,6 +247,28 @@ export class ReviewPanel implements vscode.Disposable {
         this.recordWebviewPerformance(value);
         return;
       }
+      if (value.type === "cachePdfPreview") {
+        try {
+          await this.cachePdfPreview(value);
+        } catch (error) {
+          this.output.appendLine(`[PDF 预览缓存] ${errorMessage(error)}`);
+        }
+        return;
+      }
+      if (this.activeSkillTask && [
+        "analyze",
+        "apply",
+        "compile",
+        "queueManualEdit",
+        "locateImage",
+        "queueImageEdit",
+        "undoManualEdit",
+        "redoManualEdit",
+        "clearManualEdits",
+        "resolveTrackedRevisions"
+      ].includes(value.type)) {
+        throw new Error("Skill 任务正在运行，请等待任务完成或先取消任务。");
+      }
       if (this.applying) {
         throw new Error("正在应用修订，请等待当前操作完成。");
       }
@@ -218,6 +276,7 @@ export class ReviewPanel implements vscode.Disposable {
         case "ready":
           this.post({ type: "project", root: this.project.root });
           this.updateAssistant();
+          this.updateSkills();
           this.sendManualEditsState();
           await this.sendTrackedRevisionState();
           break;
@@ -245,6 +304,15 @@ export class ReviewPanel implements vscode.Disposable {
         case "analyze":
           await this.analyze(value);
           break;
+        case "runSkillTask":
+          await this.runSkillTask(value);
+          break;
+        case "cancelSkillTask":
+          this.cancelSkillTask();
+          break;
+        case "openSkillArtifact":
+          await this.openSkillArtifact(value);
+          break;
         case "showDiff":
           await this.showDiff(value);
           break;
@@ -262,6 +330,12 @@ export class ReviewPanel implements vscode.Disposable {
           break;
         case "queueManualEdit":
           await this.queueManualEdit(value);
+          break;
+        case "locateImage":
+          await this.locateImage(value);
+          break;
+        case "queueImageEdit":
+          await this.queueImageEdit(value);
           break;
         case "undoManualEdit":
           this.undoManualEdit(value);
@@ -389,6 +463,8 @@ export class ReviewPanel implements vscode.Disposable {
       sessionId,
       mappingId: mapping.id,
       selectionKind: mapping.selection.kind,
+      interactionMode: mapping.selection.interactionMode,
+      interactionVersion: mapping.selection.interactionVersion,
       text: mapping.selection.text
     });
   }
@@ -439,13 +515,13 @@ export class ReviewPanel implements vscode.Disposable {
     if (this.candidate) {
       throw new Error("已有 AI 修订建议，请先应用或放弃后再加入手动修订。");
     }
-    if (mapping.selection.kind !== "text") {
-      throw new Error("首版手动修订仅支持普通文字拖选，不支持区域框选。");
-    }
     if (mapping.requiresConfirmation && this.confirmedMappingId !== mapping.id) {
       throw new Error("该源码范围需要核对，请先展开“源码范围”并确认。");
     }
     const kind = manualEditKind(message.kind);
+    if (mapping.selection.kind === "region" && kind !== "replace" && kind !== "delete") {
+      throw new Error("区域直接编辑只支持替换整个区域或删除整个区域。");
+    }
     if (typeof message.text !== "string" || message.text.length > 2_000) {
       throw new Error("新增或替换文字不能超过 2000 个字符。");
     }
@@ -474,6 +550,9 @@ export class ReviewPanel implements vscode.Disposable {
     }
     const caretVisibleOffset = optionalCaretVisibleOffset(message.caretVisibleOffset);
     const caretDeleteDirection = optionalCaretDeleteDirection(message.caretDeleteDirection);
+    if (mapping.selection.kind === "region" && (caretVisibleOffset !== undefined || caretDeleteDirection !== undefined)) {
+      throw new Error("区域直接编辑不接受光标偏移或方向删除参数。");
+    }
     let edit: PendingManualEdit;
     if (caretVisibleOffset !== undefined) {
       if (kind === "replace") {
@@ -485,15 +564,34 @@ export class ReviewPanel implements vscode.Disposable {
       if (kind !== "delete" && caretDeleteDirection) {
         throw new Error("只有光标删除操作可以指定删除方向。");
       }
-      edit = createPendingCaretManualEdit(
-        mapping,
-        kind,
-        message.text,
-        caretVisibleOffset,
-        rects,
-        undefined,
-        caretDeleteDirection
-      );
+      try {
+        edit = createPendingCaretManualEdit(
+          mapping,
+          kind,
+          message.text,
+          caretVisibleOffset,
+          rects,
+          undefined,
+          caretDeleteDirection
+        );
+      } catch (error) {
+        if (!(error instanceof ManualEditCaretAmbiguityError)) throw error;
+        const resolvedCaretOffset = await this.locator.disambiguateCaretOffset(
+          this.project,
+          mapping,
+          error.candidates
+        );
+        edit = createPendingCaretManualEdit(
+          mapping,
+          kind,
+          message.text,
+          caretVisibleOffset,
+          rects,
+          undefined,
+          caretDeleteDirection,
+          resolvedCaretOffset
+        );
+      }
     } else {
       if (caretDeleteDirection) {
         throw new Error("缺少光标位置，不能执行方向删除。");
@@ -501,7 +599,7 @@ export class ReviewPanel implements vscode.Disposable {
       try {
         edit = createPendingManualEdit(mapping, kind, message.text, rects);
       } catch (error) {
-        if (!(error instanceof ManualEditAmbiguityError)) {
+        if (!(error instanceof ManualEditAmbiguityError) && !(error instanceof RegionEditAmbiguityError)) {
           throw error;
         }
         const resolvedRange = await this.locator.disambiguateManualEditRange(
@@ -512,7 +610,7 @@ export class ReviewPanel implements vscode.Disposable {
         edit = createPendingManualEdit(mapping, kind, message.text, rects, undefined, resolvedRange);
       }
     }
-    validateNoOverlappingManualEdits([...this.pendingManualEdits, edit]);
+    validateNoOverlappingDocumentEdits([...this.pendingManualEdits, edit]);
     this.pendingManualEditMode ??= queueMode;
     this.pendingManualEdits.push(edit);
     this.redoManualEdits.splice(0);
@@ -520,6 +618,101 @@ export class ReviewPanel implements vscode.Disposable {
     this.clearManualPreview();
     this.post({
       type: "manualEditQueued",
+      requestId,
+      edit: manualEditForWebview(edit),
+      count: this.pendingManualEdits.length,
+      queueVersion: this.manualQueueVersion,
+      canUndo: true,
+      canRedo: false,
+      manualEditMode: this.manualEditModeForQueue()
+    });
+  }
+
+  private async locateImage(message: WebviewMessage): Promise<void> {
+    this.requireTrustedWorkspace();
+    if (this.activeAnalysisId !== undefined || this.candidate) {
+      throw new Error("AI 修订会话正在使用源码，请先结束后再调整图片。");
+    }
+    const requestId = boundedIdentifier(message.requestId, "图片定位请求");
+    const sequence = ++this.imageSelectionSequence;
+    this.imageEditTarget = undefined;
+    const selection = parsePdfImageSelectionPayload(message);
+    this.post({ type: "busy", action: "locateImage", requestId, message: "正在定位图片对应的 LaTeX 命令……" });
+    await this.ensureArtifactsCurrent();
+    await this.ensureSourceSaved();
+    const records = await this.locator.mapImageSelection(this.project, selection);
+    const source = await fs.readFile(this.project.tex, "utf8");
+    let candidates = chooseImageCandidatesByMappedLines(
+      await findImageEditCandidates(source, this.project.root),
+      records
+    );
+    if (candidates.length === 0) {
+      throw new Error("框选区域附近没有找到受支持的图片命令。首版只支持普通 includegraphics 和简单 subfigure 尺寸。");
+    }
+    let candidate = candidates[0];
+    if (candidates.length > 1) {
+      candidate = await this.locator.disambiguateImageCandidate(this.project, candidates, selection);
+      candidates = [candidate];
+    }
+    const forwardRecords = await this.locator.locateImageCandidateViews(this.project, candidate, selection.page);
+    validateImageSelectionConsistency(selection, forwardRecords);
+    if (this.disposed || sequence !== this.imageSelectionSequence) return;
+    const currentSource = await fs.readFile(this.project.tex, "utf8");
+    if (currentSource !== source) {
+      throw new Error("图片定位期间 main.tex 发生了变化，请重新框选图片。");
+    }
+    const target = createImageEditTarget(candidate, selection, source);
+    this.imageEditTarget = target;
+    this.post({
+      type: "imageEditTarget",
+      requestId,
+      targetId: target.id,
+      page: target.page,
+      rects: target.rects,
+      roughBounds: selection.roughBounds,
+      snappedBounds: selection.bounds,
+      pageWidth: selection.pageWidth,
+      pageHeight: selection.pageHeight,
+      imageObjectName: selection.imageObjectName,
+      imagePath: target.imagePath,
+      parameter: target.parameter,
+      originalValue: target.originalDisplay,
+      candidateValue: formatImageCandidateValue(target, 1),
+      factor: 1
+    });
+  }
+
+  private async queueImageEdit(message: WebviewMessage): Promise<void> {
+    this.requireTrustedWorkspace();
+    const requestId = boundedIdentifier(message.requestId, "图片调整请求");
+    const targetId = boundedIdentifier(message.targetId, "图片调整目标");
+    const queueVersion = this.requireManualQueueVersion(message);
+    const target = this.imageEditTarget;
+    if (!target || target.id !== targetId) {
+      throw new Error("图片调整目标已失效，请重新框选图片。");
+    }
+    if (this.pendingManualEditMode === "tracked") {
+      throw new Error("图片尺寸调整不能与修订痕迹队列混合。请先应用或清空现有修订。");
+    }
+    await this.ensureSourceSaved();
+    const source = await fs.readFile(this.project.tex, "utf8");
+    if (target.baseDocumentHash !== sha256(source)) {
+      throw new Error("图片命令在确认前发生了变化，请重新框选图片。");
+    }
+    if (this.manualQueueVersion !== queueVersion) {
+      throw new Error("待编译队列在确认期间发生了变化，请重试。");
+    }
+    const factor = boundedImageScaleFactor(message.factor);
+    const edit = createPendingImageEdit(target, factor);
+    validateNoOverlappingDocumentEdits([...this.pendingManualEdits, edit]);
+    this.pendingManualEditMode ??= "direct";
+    this.pendingManualEdits.push(edit);
+    this.redoManualEdits.splice(0);
+    this.imageEditTarget = undefined;
+    this.manualQueueVersion += 1;
+    this.clearManualPreview();
+    this.post({
+      type: "imageEditQueued",
       requestId,
       edit: manualEditForWebview(edit),
       count: this.pendingManualEdits.length,
@@ -559,7 +752,7 @@ export class ReviewPanel implements vscode.Disposable {
       this.sendManualEditsState();
       return;
     }
-    validateNoOverlappingManualEdits([...this.pendingManualEdits, restored]);
+    validateNoOverlappingDocumentEdits([...this.pendingManualEdits, restored]);
     this.redoManualEdits.pop();
     this.pendingManualEdits.push(restored);
     this.manualQueueVersion += 1;
@@ -774,6 +967,123 @@ export class ReviewPanel implements vscode.Disposable {
     }
   }
 
+  private async runSkillTask(message: WebviewMessage): Promise<void> {
+    this.requireTrustedWorkspace();
+    if (this.activeSkillTask) {
+      throw new Error("已有 Skill 任务正在执行，请等待或先取消当前任务。");
+    }
+    if (this.applying || this.activeAnalysisId !== undefined) {
+      throw new Error("当前修订操作尚未完成，暂时不能启动 Skill 任务。");
+    }
+    if (this.pendingManualEdits.length > 0 || this.candidate) {
+      throw new Error("请先应用或清空当前修订，再启动 Skill 任务。");
+    }
+    const skillId = boundedIdentifier(message.skillId, "Skill");
+    const skill = this.skillRegistry.get(skillId);
+    if (!skill || !skill.enabled) {
+      throw new Error("所选 Skill 不存在或已停用，请刷新后重新选择。");
+    }
+    const instruction = boundedString(message.instruction, 1, 4_000, "任务提示词");
+    const useSelection = booleanValue(message.useSelection);
+    let selection;
+    if (skill.permissions.scope === "selection" || useSelection) {
+      if (!this.mapping || !this.sessionId) {
+        throw new Error("该任务需要 PDF 选区，请先选择并定位内容。");
+      }
+      if (this.mapping.requiresConfirmation && this.confirmedMappingId !== this.mapping.id) {
+        throw new Error("该 PDF 选区的源码范围需要先人工确认。");
+      }
+      selection = this.mapping.selection;
+    }
+    if (skill.permissions.scope === "document" && useSelection) {
+      throw new Error("该 Skill 只支持整篇论文任务。");
+    }
+    if (selectedAssistantId() !== "codex") {
+      throw new Error("首版外部 Skill 任务仅支持 Codex。请在左侧设置中将 AI 助手切换为 Codex 后再执行。");
+    }
+    await this.ensureSourceSaved();
+    if (!(await isFile(this.project.pdf))) {
+      throw new Error("未找到 main.pdf，请先手动编译论文。");
+    }
+    const controller = new AbortController();
+    this.activeSkillTask = { controller, skillId: skill.id };
+    this.lastSkillResult = undefined;
+    this.post({
+      type: "skillTaskStarted",
+      skillId: skill.id,
+      skillName: skill.displayName,
+      message: `正在准备 ${skill.displayName} 任务……`
+    });
+    try {
+      const result = await this.skillTaskService.run({
+        skill,
+        project: this.project,
+        prompt: instruction,
+        selection,
+        sourceRange: selection && this.mapping ? {
+          startLine: this.mapping.startLine,
+          endLine: this.mapping.endLine,
+          sourceText: this.mapping.sourceText
+        } : undefined,
+        codexCommand: vscode.workspace.getConfiguration("circletex").get<string>("codexCommand", "codex"),
+        signal: controller.signal,
+        onProgress: (progress) => this.post({ type: "skillTaskProgress", ...progress }),
+        onOutput: (text) => this.output.append(text)
+      });
+      this.lastSkillResult = result;
+      if (result.status === "completed") {
+        this.post({
+          type: "skillTaskCompleted",
+          summary: result.summary,
+          warnings: result.warnings,
+          publishedDirectory: result.publishedDirectory,
+          artifacts: result.artifacts.map((artifact, index) => ({
+            index,
+            name: artifact.name,
+            relativePath: artifact.relativePath,
+            type: artifact.type,
+            description: artifact.description,
+            size: artifact.size
+          }))
+        });
+      } else if (result.status === "cancelled") {
+        this.post({ type: "skillTaskCancelled", message: result.summary });
+      } else {
+        this.post({ type: "skillTaskFailed", message: result.error || result.summary });
+      }
+    } finally {
+      if (this.activeSkillTask?.controller === controller) {
+        this.activeSkillTask = undefined;
+      }
+    }
+  }
+
+  private cancelSkillTask(): void {
+    if (!this.activeSkillTask) {
+      this.post({ type: "notice", message: "当前没有正在运行的 Skill 任务。" });
+      return;
+    }
+    this.activeSkillTask.controller.abort();
+    this.post({ type: "skillTaskCancelling", message: "正在取消 Skill 任务……" });
+  }
+
+  private async openSkillArtifact(message: WebviewMessage): Promise<void> {
+    const index = nonNegativeInteger(message.index, "产物索引");
+    const artifact = this.lastSkillResult?.status === "completed" ? this.lastSkillResult.artifacts[index] : undefined;
+    if (!artifact) {
+      throw new Error("所选 Skill 产物已失效，请从任务历史中查看。");
+    }
+    const action = stringValue(message.action);
+    if (action === "reveal") {
+      await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(artifact.absolutePath));
+      return;
+    }
+    await vscode.commands.executeCommand("vscode.open", vscode.Uri.file(artifact.absolutePath), {
+      preview: true,
+      preserveFocus: false
+    });
+  }
+
   private async showDiff(message: WebviewMessage): Promise<void> {
     const candidate = this.requireCandidate(message);
     await this.openCandidateDiff(candidate, false);
@@ -816,8 +1126,8 @@ export class ReviewPanel implements vscode.Disposable {
         throw new Error("main.tex 中仍有 CircleTeX 修订标记。直接编辑不会自动决定这些修订，请先选择“接受全部”或“拒绝全部”。");
       }
       const stagedText = mode === "direct"
-        ? applyDirectManualEdits(originalText, edits)
-        : applyManualEdits(originalText, edits);
+        ? applyDirectDocumentEdits(originalText, edits)
+        : applyManualEdits(originalText, textOnlyEdits(edits));
       if (mode === "tracked") {
         await this.openManualEditsDiff(stagedText, `修订痕迹预览（${edits.length} 项）`);
         const action = await vscode.window.showWarningMessage(
@@ -854,7 +1164,7 @@ export class ReviewPanel implements vscode.Disposable {
         configuredManualEditMode: this.configuredManualEditMode(),
         modeLocked: false
       });
-      this.post({ type: "compiled", token: Date.now(), warnings: result.warnings });
+      this.postCompiled(result.warnings);
       await this.sendTrackedRevisionState();
     } finally {
       this.applying = false;
@@ -880,8 +1190,8 @@ export class ReviewPanel implements vscode.Disposable {
         throw new Error("main.tex 中仍有 CircleTeX 修订标记。请先接受或拒绝现有修订，再预览直接编辑。");
       }
       const stagedText = mode === "direct"
-        ? applyDirectManualEdits(originalText, edits)
-        : applyManualEdits(originalText, edits);
+        ? applyDirectDocumentEdits(originalText, edits)
+        : applyManualEdits(originalText, textOnlyEdits(edits));
       if (
         this.manualQueueVersion !== queueVersion ||
         this.pendingManualEdits.length !== edits.length ||
@@ -944,7 +1254,7 @@ export class ReviewPanel implements vscode.Disposable {
         this.sendManualEditsState();
       }
       this.clearManualPreview();
-      this.post({ type: "compiled", token: Date.now(), warnings: result.warnings });
+      this.postCompiled(result.warnings);
       await this.sendTrackedRevisionState();
     } catch (error) {
       this.showCompileError(errorMessage(error));
@@ -1256,6 +1566,9 @@ export class ReviewPanel implements vscode.Disposable {
       mappingId: mapping.id,
       selectionKind: mapping.selection.kind,
       page: mapping.selection.page,
+      endPage: mapping.selection.kind === "text"
+        ? mapping.selection.pageFragments?.at(-1)?.page ?? mapping.selection.page
+        : mapping.selection.page,
       selectionLength: mapping.selection.text.length,
       startLine: mapping.startLine,
       endLine: mapping.endLine,
@@ -1335,6 +1648,9 @@ export class ReviewPanel implements vscode.Disposable {
     if (message.type === "queueManualEdit") {
       return Boolean(stringValue(message.requestId));
     }
+    if (message.type === "locateImage" || message.type === "queueImageEdit") {
+      return Boolean(stringValue(message.requestId));
+    }
     const sessionId = stringValue(message.sessionId);
     return !sessionId || sessionId === this.sessionId;
   }
@@ -1346,6 +1662,8 @@ export class ReviewPanel implements vscode.Disposable {
     this.selectionSequence += 1;
     this.rangeSequence += 1;
     this.analysisSequence += 1;
+    this.imageSelectionSequence += 1;
+    this.imageEditTarget = undefined;
     this.activeAnalysisId = undefined;
     this.sessionId = undefined;
     this.selectionRequestId = undefined;
@@ -1401,7 +1719,13 @@ export class ReviewPanel implements vscode.Disposable {
     const label = typeof message.label === "string" ? message.label : "";
     const durationMs = typeof message.durationMs === "number" ? message.durationMs : Number.NaN;
     const allowedLabels = new Set([
+      "PDF Webview 启动",
       "PDF 文件读取",
+      "PDF Worker 解析",
+      "PDF 首屏页面壳体",
+      "PDF 首屏低清预览",
+      "PDF 首屏 Canvas",
+      "PDF 首屏文字层",
       "PDF 页面元数据扫描",
       "PDF 当前页渲染",
       "PDF 刷新总计"
@@ -1410,6 +1734,88 @@ export class ReviewPanel implements vscode.Disposable {
       return;
     }
     this.output.appendLine(`[耗时] ${label}：${(durationMs / 1_000).toFixed(2)} 秒。`);
+  }
+
+  private async cachePdfPreview(message: WebviewMessage): Promise<void> {
+    const key = boundedPreviewKey(message.key);
+    if (key !== this.previewKeyFor(this.pdfFingerprint())) {
+      return;
+    }
+    const dataUrl = boundedPreviewDataUrl(message.dataUrl);
+    const page = positiveInteger(message.page, "预览页码");
+    const widthPt = boundedDimension(message.widthPt, "预览页宽度");
+    const heightPt = boundedDimension(message.heightPt, "预览页高度");
+    const directory = vscode.Uri.joinPath(this.context.globalStorageUri, "pdf-previews").fsPath;
+    await fs.mkdir(directory, { recursive: true });
+    const target = path.join(directory, `${key}.jpg`);
+    const staging = `${target}.tmp-${process.pid}-${Date.now()}`;
+    const metadataTarget = path.join(directory, `${key}.json`);
+    const metadataStaging = `${metadataTarget}.tmp-${process.pid}-${Date.now()}`;
+    const decoded = Buffer.from(dataUrl.slice("data:image/jpeg;base64,".length), "base64");
+    await fs.writeFile(staging, new Uint8Array(decoded.buffer, decoded.byteOffset, decoded.byteLength));
+    await fs.writeFile(metadataStaging, JSON.stringify({ page, widthPt, heightPt }), "utf8");
+    try {
+      await Promise.allSettled([fs.rm(target, { force: true }), fs.rm(metadataTarget, { force: true })]);
+      await fs.rename(staging, target);
+      await fs.rename(metadataStaging, metadataTarget);
+    } catch (error) {
+      await Promise.allSettled([fs.rm(staging, { force: true }), fs.rm(metadataStaging, { force: true })]);
+      throw error;
+    }
+    void this.prunePdfPreviews(directory, key);
+  }
+
+  private async prunePdfPreviews(directory: string, currentKey: string): Promise<void> {
+    try {
+      const entries = await fs.readdir(directory, { withFileTypes: true });
+      const files = await Promise.all(entries.filter((entry) => entry.isFile() && entry.name.endsWith(".jpg")).map(async (entry) => ({
+        name: entry.name,
+        mtimeMs: (await fs.stat(path.join(directory, entry.name))).mtimeMs
+      })));
+      for (const file of files.sort((left, right) => right.mtimeMs - left.mtimeMs).slice(12)) {
+        if (file.name !== `${currentKey}.jpg`) {
+          await fs.rm(path.join(directory, file.name), { force: true });
+          await fs.rm(path.join(directory, file.name.replace(/\.jpg$/, ".json")), { force: true });
+        }
+      }
+    } catch {
+      // 预览缓存清理失败不影响 PDF 阅读。
+    }
+  }
+
+  private postCompiled(warnings: readonly string[]): void {
+    this.post({
+      type: "compiled",
+      token: Date.now(),
+      warnings,
+      pdfFingerprint: this.pdfFingerprint(),
+      previewKey: this.previewKeyFor(this.pdfFingerprint())
+    });
+  }
+
+  private pdfFingerprint(): string {
+    const stat = fsSync.statSync(this.project.pdf, { throwIfNoEntry: false });
+    return stat?.isFile() ? `${Math.trunc(stat.mtimeMs)}-${stat.size}` : "missing";
+  }
+
+  private previewKeyFor(fingerprint: string): string {
+    return sha256(`${samePathKey(this.project.pdf)}\0${fingerprint}`).slice(0, 40);
+  }
+
+  private readPdfPreview(key: string): { uri: string; page: number; widthPt: number; heightPt: number } | undefined {
+    try {
+      const directory = vscode.Uri.joinPath(this.context.globalStorageUri, "pdf-previews");
+      const imagePath = vscode.Uri.joinPath(directory, `${key}.jpg`).fsPath;
+      const metadataPath = vscode.Uri.joinPath(directory, `${key}.json`).fsPath;
+      if (!fsSync.statSync(imagePath, { throwIfNoEntry: false })?.isFile()) return undefined;
+      const value = JSON.parse(fsSync.readFileSync(metadataPath, "utf8")) as Record<string, unknown>;
+      const page = positiveInteger(value.page, "预览页码");
+      const widthPt = boundedDimension(value.widthPt, "预览页宽度");
+      const heightPt = boundedDimension(value.heightPt, "预览页高度");
+      return { uri: this.panel.webview.asWebviewUri(vscode.Uri.file(imagePath)).toString(), page, widthPt, heightPt };
+    } catch {
+      return undefined;
+    }
   }
 
   private post(message: Record<string, unknown>): void {
@@ -1428,13 +1834,20 @@ export class ReviewPanel implements vscode.Disposable {
     const cMapUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, "media", "pdfjs", "cmaps"));
     const standardFontsUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, "media", "pdfjs", "standard_fonts"));
     const pdfUri = webview.asWebviewUri(vscode.Uri.file(this.project.pdf));
+    const pdfFingerprint = this.pdfFingerprint();
+    const previewKey = this.previewKeyFor(pdfFingerprint);
+    const preview = this.readPdfPreview(previewKey);
     const config = JSON.stringify({
       pdfUri: pdfUri.toString(),
       pdfJsUri: pdfJsUri.toString(),
       workerUri: workerUri.toString(),
       cMapUri: `${cMapUri.toString()}/`,
       standardFontsUri: `${standardFontsUri.toString()}/`,
-      manualEditMode: this.configuredManualEditMode()
+      manualEditMode: this.configuredManualEditMode(),
+      pdfFingerprint,
+      previewKey,
+      preview,
+      extensionCreatedAt: Date.now()
     }).replace(/</g, "\\u003c");
     const source = webview.cspSource;
 
@@ -1506,6 +1919,13 @@ export class ReviewPanel implements vscode.Disposable {
         </div>
       </div>
       <div class="prompt-bar">
+        <div class="task-selector-row">
+          <label for="task-mode">任务</label>
+          <select id="task-mode" aria-label="选择局部修订或外部 Skill">
+            <option value="revision">局部修订</option>
+          </select>
+          <span id="task-scope-note">需要 PDF 选区</span>
+        </div>
         <div class="analysis-row">
           <textarea id="instruction" maxlength="4000" disabled placeholder="先在 PDF 中划选内容，再输入修改要求。"></textarea>
           <button id="analyze" class="primary-button" disabled>交给 AI 助手分析</button>
@@ -1519,6 +1939,7 @@ export class ReviewPanel implements vscode.Disposable {
           </div>
         </div>
       </div>
+      <div id="skill-artifacts" class="skill-artifacts" hidden aria-live="polite"></div>
       <div id="compile-progress" class="compile-progress" hidden aria-live="polite">
         <div class="compile-progress-meta"><span id="compile-progress-label">准备编译</span><span id="compile-progress-value">0%</span></div>
         <div id="compile-progress-track" class="compile-progress-track" role="progressbar" aria-label="论文编译进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
@@ -1659,7 +2080,8 @@ function manualEditRects(value: unknown): NormalizedManualEditRect[] {
     if (x + width > 1.000001 || y + height > 1.000001) {
       throw new Error("手动修订矩形超出 PDF 页面范围。");
     }
-    return { x, y, width, height };
+    const page = rect.page === undefined ? undefined : positiveInteger(rect.page, "手动修订矩形页码");
+    return { ...(page === undefined ? {} : { page }), x, y, width, height };
   });
 }
 
@@ -1676,7 +2098,20 @@ function normalizedCoordinate(value: unknown, name: string, allowZero = true): n
   return value;
 }
 
-function manualEditForWebview(edit: PendingManualEdit): Record<string, unknown> {
+function manualEditForWebview(edit: PendingDocumentEdit): Record<string, unknown> {
+  if (isPendingImageEdit(edit)) {
+    return {
+      editType: "image",
+      id: edit.id,
+      kind: edit.kind,
+      page: edit.page,
+      rects: edit.rects,
+      imagePath: edit.imagePath,
+      originalValue: edit.originalValue,
+      candidateValue: edit.candidateValue,
+      factor: edit.factor
+    };
+  }
   return {
     id: edit.id,
     kind: edit.kind,
@@ -1684,6 +2119,20 @@ function manualEditForWebview(edit: PendingManualEdit): Record<string, unknown> 
     rects: edit.rects,
     insertedText: edit.insertedText
   };
+}
+
+function textOnlyEdits(edits: readonly PendingDocumentEdit[]): PendingManualEdit[] {
+  if (edits.some(isPendingImageEdit)) {
+    throw new Error("图片尺寸调整只支持直接编辑模式，不能写入修订痕迹。");
+  }
+  return edits as PendingManualEdit[];
+}
+
+function boundedImageScaleFactor(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0.25 || value > 3) {
+    throw new Error("图片缩放比例必须位于 25% 至 300% 之间。");
+  }
+  return value;
 }
 
 async function replaceDocumentText(document: vscode.TextDocument, value: string): Promise<void> {
@@ -1737,6 +2186,17 @@ function positiveInteger(value: unknown, name: string): number {
   return value;
 }
 
+function nonNegativeInteger(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 100_000) {
+    throw new Error(`${name}无效。`);
+  }
+  return value;
+}
+
+function booleanValue(value: unknown): boolean {
+  return value === true;
+}
+
 function boundedString(value: unknown, minimum: number, maximum: number, name: string): string {
   if (typeof value !== "string" || value.trim().length < minimum || value.length > maximum) {
     throw new Error(`${name}长度无效。`);
@@ -1747,6 +2207,32 @@ function boundedString(value: unknown, minimum: number, maximum: number, name: s
 function boundedIdentifier(value: unknown, name: string): string {
   if (typeof value !== "string" || value.length < 1 || value.length > 128 || !/^[A-Za-z0-9_-]+$/.test(value)) {
     throw new Error(`${name}标识无效。`);
+  }
+  return value;
+}
+
+function boundedPreviewKey(value: unknown): string {
+  if (typeof value !== "string" || !/^[a-f0-9]{40}$/.test(value)) {
+    throw new Error("PDF 预览缓存标识无效。");
+  }
+  return value;
+}
+
+function boundedPreviewDataUrl(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.length < 100 ||
+    value.length > 1_500_000 ||
+    !/^data:image\/jpeg;base64,[A-Za-z0-9+/]+=*$/.test(value)
+  ) {
+    throw new Error("PDF 预览缓存数据无效。");
+  }
+  return value;
+}
+
+function boundedDimension(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 100 || value > 5_000) {
+    throw new Error(`${name}无效。`);
   }
   return value;
 }
@@ -1779,4 +2265,21 @@ function withCompileWarning(result: CompileResult, warning: string): CompileResu
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function samePathKey(value: string): string {
+  const resolved = path.resolve(value).replace(/\\/g, "/");
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function skillsForWebview(skills: ImportedSkill[]): Array<Record<string, unknown>> {
+  return skills.filter((skill) => skill.enabled).map((skill) => ({
+    id: skill.id,
+    name: skill.displayName,
+    description: skill.description,
+    taskType: skill.permissions.taskType,
+    scope: skill.permissions.scope,
+    inputPreset: skill.permissions.inputPreset,
+    outputExtensions: skill.permissions.outputExtensions
+  }));
 }

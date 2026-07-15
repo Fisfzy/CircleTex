@@ -1,8 +1,8 @@
 {
   "name": "circletex",
   "displayName": "CircleTeX",
-  "description": "在 PDF 审阅界面中用键盘直接增删改 LaTeX 正文，或调用 AI 助手生成受控修订。",
-  "version": "0.7.3",
+  "description": "在 PDF 审阅界面中直接修改 LaTeX 正文与图片尺寸，或以受控快照运行外部 Skill。",
+  "version": "0.9.1",
   "publisher": "local",
   "license": "SEE LICENSE IN LICENSE.txt",
   "engines": {
@@ -25,12 +25,19 @@
     "onStartupFinished",
     "onView:circletex.start",
     "onView:circletex.settings",
+    "onView:circletex.skills",
     "onCommand:circletex.openPdfReview",
     "onCommand:circletex.configureProject",
     "onCommand:circletex.compileDocument",
     "onCommand:circletex.selectAssistant",
     "onCommand:circletex.selectManualEditMode",
-    "onCommand:circletex.showOutput"
+    "onCommand:circletex.showOutput",
+    "onCommand:circletex.importSkill",
+    "onCommand:circletex.updateSkill",
+    "onCommand:circletex.toggleSkill",
+    "onCommand:circletex.removeSkill",
+    "onCommand:circletex.showSkillDetails",
+    "onCommand:circletex.showSkillHistory"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -58,6 +65,34 @@
       {
         "command": "circletex.showOutput",
         "title": "CircleTeX：查看编译日志"
+      },
+      {
+        "command": "circletex.importSkill",
+        "title": "CircleTeX：导入外部 Skill",
+        "icon": "$(add)"
+      },
+      {
+        "command": "circletex.updateSkill",
+        "title": "CircleTeX：更新 Skill",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "circletex.toggleSkill",
+        "title": "CircleTeX：启用或停用 Skill"
+      },
+      {
+        "command": "circletex.removeSkill",
+        "title": "CircleTeX：移除 Skill",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "circletex.showSkillDetails",
+        "title": "CircleTeX：查看 Skill 详情"
+      },
+      {
+        "command": "circletex.showSkillHistory",
+        "title": "CircleTeX：查看 Skill 任务历史",
+        "icon": "$(history)"
       }
     ],
     "viewsContainers": {
@@ -78,9 +113,19 @@
         {
           "id": "circletex.settings",
           "name": "设置"
+        },
+        {
+          "id": "circletex.skills",
+          "name": "外部 Skill"
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "circletex.skills",
+        "contents": "尚未导入外部 Skill。\n[导入外部 Skill](command:circletex.importSkill)"
+      }
+    ],
     "menus": {
       "view/title": [
         {
@@ -96,6 +141,38 @@
         {
           "command": "circletex.configureProject",
           "when": "view == circletex.start",
+          "group": "navigation@3"
+        },
+        {
+          "command": "circletex.importSkill",
+          "when": "view == circletex.skills",
+          "group": "navigation@1"
+        },
+        {
+          "command": "circletex.showSkillHistory",
+          "when": "view == circletex.skills",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "circletex.updateSkill",
+          "when": "view == circletex.skills",
+          "group": "inline@1"
+        },
+        {
+          "command": "circletex.toggleSkill",
+          "when": "view == circletex.skills",
+          "group": "navigation@1"
+        },
+        {
+          "command": "circletex.removeSkill",
+          "when": "view == circletex.skills",
+          "group": "navigation@2"
+        },
+        {
+          "command": "circletex.showSkillHistory",
+          "when": "view == circletex.skills",
           "group": "navigation@3"
         }
       ]
@@ -179,7 +256,7 @@
     "compile": "npm run copy:assets && tsc -p ./",
     "watch": "tsc -watch -p ./",
     "check:webview": "node --check media/viewer.js",
-    "test:unit": "node --test out/test/applyRange.test.js out/test/assistantTypes.test.js out/test/codex.test.js out/test/compilerTransaction.test.js out/test/manualEdits.test.js out/test/processRunner.test.js out/test/selectionPayload.test.js out/test/snow.test.js out/test/synctex.test.js out/test/synctexParser.test.js",
+    "test:unit": "node --test out/test/applyRange.test.js out/test/assistantTypes.test.js out/test/codex.test.js out/test/compilerTransaction.test.js out/test/imageBoundary.test.js out/test/imageEditResolver.test.js out/test/latexProjection.test.js out/test/manualEdits.test.js out/test/processRunner.test.js out/test/regionEditResolver.test.js out/test/selectionPayload.test.js out/test/skillPackage.test.js out/test/skillRegistry.test.js out/test/skillTask.test.js out/test/snow.test.js out/test/synctex.test.js out/test/synctexParser.test.js",
     "test:manual-tex": "node scripts/smoke-manual-tex.mjs",
     "test:viewer": "node scripts/smoke-viewer.mjs",
     "test": "npm run compile && npm run check:webview && npm run test:unit && npm run test:manual-tex && npm run test:viewer",

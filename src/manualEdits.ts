@@ -1,10 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
+import {
+  adjacentEditableLatexRange,
+  isEditableLatexBoundary,
+  isEditableLatexTextRange,
+  structuredCaretCandidates
+} from "./latexProjection";
+import {
+  resolveRegionEditSourceRange,
+  validateResolvedRegionEditRange
+} from "./regionEditResolver";
 import { SourceMapping } from "./types";
 
 export type ManualEditKind = "insertBefore" | "insertAfter" | "delete" | "replace";
 export type CaretDeleteDirection = "backward" | "forward";
 
 export interface NormalizedManualEditRect {
+  page?: number;
   x: number;
   y: number;
   width: number;
@@ -36,6 +47,13 @@ export class ManualEditAmbiguityError extends Error {
   }
 }
 
+export class ManualEditCaretAmbiguityError extends Error {
+  public constructor(public readonly candidates: readonly number[]) {
+    super("光标位置对应多个候选边界，需要结合 PDF 位置进一步确认安全的 LaTeX 正文边界。");
+    this.name = "ManualEditCaretAmbiguityError";
+  }
+}
+
 interface ManualEditSelectionMatch {
   selected: CollapsedText;
   source: CollapsedText;
@@ -56,29 +74,20 @@ const DELETED_COMMAND = "\\CircleTeXDeleted";
 const SOURCE_FORBIDDEN = /[\\{}$%&#_^~]/u;
 const UNSAFE_TEXT_CONTROLS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u202A-\u202E\u2066-\u2069]/u;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter("und", { granularity: "grapheme" });
-const CARET_ANCHOR_MAX_GRAPHEMES = 12;
-const CARET_ANCHOR_MIN_GRAPHEMES = 4;
-
 class ManualEditCharacterMatchError extends Error {
   public constructor() {
     super("PDF 文字无法在映射源码中建立字符级匹配。");
     this.name = "ManualEditCharacterMatchError";
   }
 }
-const MATH_ENVIRONMENTS = new Set([
-  "math", "displaymath", "equation", "eqnarray", "align", "alignat", "flalign",
-  "gather", "multline", "split", "aligned", "alignedat", "gathered", "cases",
-  "matrix", "pmatrix", "bmatrix", "vmatrix", "smallmatrix"
-]);
-const TABLE_ENVIRONMENTS = new Set(["array", "tabular", "tabularx", "longtable"]);
-const VERBATIM_ENVIRONMENTS = new Set([
-  "verbatim", "verbatimtab", "lstlisting", "minted"
-]);
 
 /**
  * 将 PDF 可见文字唯一定位到 SyncTeX 给出的源码窗口，并返回文档绝对偏移。
  */
 export function resolveManualEditSourceRange(mapping: SourceMapping): ManualEditSourceRange {
+  if (mapping.selection.kind === "region") {
+    return resolveRegionEditSourceRange(mapping);
+  }
   const match = resolveManualEditSelectionMatch(mapping);
   return {
     startOffset: mapping.startOffset + match.localStart,
@@ -277,44 +286,21 @@ function resolveManualEditInsertionOffset(mapping: SourceMapping, caretVisibleOf
   }
 
   const selected = collapseVisibleText(mapping.selection.text);
-  const source = collapseVisibleText(mapping.sourceText);
   const visibleLength = selected.graphemes.length;
   validateCaretVisibleOffset(caretVisibleOffset, visibleLength);
-  const leftLengths = caretAnchorLengths(caretVisibleOffset);
-  const rightLengths = caretAnchorLengths(visibleLength - caretVisibleOffset);
-  if (leftLengths.length === 0 || rightLengths.length === 0) {
-    throw new Error("光标两侧的普通文字不足，无法安全定位插入点。请改用唯一短语替换。");
+  const candidates = structuredCaretCandidates(
+    mapping.sourceText,
+    mapping.selection.text,
+    caretVisibleOffset
+  ).map((candidate) => mapping.startOffset + candidate.offset);
+  if (candidates.length === 1) {
+    validateOrdinaryInsertionPoint(mapping.sourceText, candidates[0] - mapping.startOffset);
+    return candidates[0];
   }
-
-  const anchorPairs = leftLengths.flatMap((leftLength) => rightLengths.map((rightLength) => ({
-    leftLength,
-    rightLength,
-    score: leftLength + rightLength
-  })));
-  const scores = [...new Set(anchorPairs.map((pair) => pair.score))].sort((left, right) => right - left);
-  for (const score of scores) {
-    const candidateOffsets = new Set<number>();
-    for (const pair of anchorPairs.filter((item) => item.score === score)) {
-      const leftAnchor = selected.graphemes.slice(caretVisibleOffset - pair.leftLength, caretVisibleOffset);
-      const rightAnchor = selected.graphemes.slice(caretVisibleOffset, caretVisibleOffset + pair.rightLength);
-      if (!isUsefulCaretAnchor(leftAnchor) || !isUsefulCaretAnchor(rightAnchor)) {
-        continue;
-      }
-      for (const offset of adaptiveCaretCandidateOffsets(mapping.sourceText, source, leftAnchor, rightAnchor)) {
-        candidateOffsets.add(offset);
-      }
-    }
-    if (candidateOffsets.size > 1) {
-      throw new Error("光标两侧的普通文字在映射源码中存在多个候选边界，已拒绝猜测插入位置。");
-    }
-    if (candidateOffsets.size === 1) {
-      const localOffset = [...candidateOffsets][0];
-      validateOrdinaryInsertionPoint(mapping.sourceText, localOffset);
-      return mapping.startOffset + localOffset;
-    }
+  if (candidates.length > 1) {
+    throw new ManualEditCaretAmbiguityError(candidates);
   }
-
-  throw new Error("光标两侧的 PDF 文字无法唯一映射到普通 LaTeX 正文边界。请避开公式或引用，或改用唯一短语替换。");
+  throw new Error("该 PDF 光标位于公式、引用或未知 LaTeX 结构内部，无法确定安全的普通正文边界。请单击结构前后，或拖选普通文字替换。");
 }
 
 function validateCaretVisibleOffset(caretVisibleOffset: number, visibleLength: number): void {
@@ -325,51 +311,6 @@ function validateCaretVisibleOffset(caretVisibleOffset: number, visibleLength: n
   ) {
     throw new Error(`光标可见字符偏移必须位于 0 至 ${visibleLength} 之间。`);
   }
-}
-
-function caretAnchorLengths(available: number): number[] {
-  if (available < CARET_ANCHOR_MIN_GRAPHEMES) {
-    return [];
-  }
-  const maximum = Math.min(CARET_ANCHOR_MAX_GRAPHEMES, available);
-  return [...new Set([maximum, 10, 8, 6, CARET_ANCHOR_MIN_GRAPHEMES]
-    .filter((length) => length >= CARET_ANCHOR_MIN_GRAPHEMES && length <= maximum))]
-    .sort((left, right) => right - left);
-}
-
-function isUsefulCaretAnchor(graphemes: readonly string[]): boolean {
-  return (graphemes.join("").match(/[\p{L}\p{N}]/gu)?.length ?? 0) >= 3;
-}
-
-function adaptiveCaretCandidateOffsets(
-  sourceText: string,
-  source: CollapsedText,
-  leftAnchor: readonly string[],
-  rightAnchor: readonly string[]
-): number[] {
-  const leftStarts = graphemeSequenceStarts(source.graphemes, leftAnchor);
-  const rightStarts = graphemeSequenceStarts(source.graphemes, rightAnchor);
-  const offsets = new Set<number>();
-  for (const leftStart of leftStarts) {
-    const leftEnd = source.ends[leftStart + leftAnchor.length - 1];
-    for (const rightStartIndex of rightStarts) {
-      const rightStart = source.starts[rightStartIndex];
-      if (leftEnd <= rightStart && /^\s*$/u.test(sourceText.slice(leftEnd, rightStart))) {
-        offsets.add(rightStart);
-      }
-    }
-  }
-  return [...offsets];
-}
-
-function graphemeSequenceStarts(source: readonly string[], wanted: readonly string[]): number[] {
-  const starts: number[] = [];
-  for (let index = 0; index <= source.length - wanted.length; index += 1) {
-    if (wanted.every((grapheme, wantedIndex) => source[index + wantedIndex] === grapheme)) {
-      starts.push(index);
-    }
-  }
-  return starts;
 }
 
 export function createPendingManualEdit(
@@ -409,6 +350,9 @@ function validateResolvedManualEditRange(
   mapping: SourceMapping,
   range: ManualEditSourceRange
 ): ManualEditSourceRange {
+  if (mapping.selection.kind === "region") {
+    return validateResolvedRegionEditRange(mapping, range);
+  }
   const localStart = range.startOffset - mapping.startOffset;
   const localEnd = range.endOffset - mapping.startOffset;
   if (
@@ -435,7 +379,8 @@ export function createPendingCaretManualEdit(
   caretVisibleOffset: number,
   rects: readonly NormalizedManualEditRect[],
   id: string = randomUUID(),
-  deleteDirection?: CaretDeleteDirection
+  deleteDirection?: CaretDeleteDirection,
+  resolvedCaretOffset?: number
 ): PendingManualEdit {
   if (kind !== "insertBefore" && kind !== "insertAfter" && kind !== "delete") {
     throw new Error("光标手动编辑仅支持插入或相邻字符删除。");
@@ -455,21 +400,33 @@ export function createPendingCaretManualEdit(
     if (deleteDirection !== "backward" && deleteDirection !== "forward") {
       throw new Error("光标删除必须指定 backward 或 forward 方向。");
     }
-    const resolved = resolveManualEditCaret(mapping, caretVisibleOffset);
-    startOffset = mapping.startOffset + resolved.localOffset;
-    endOffset = startOffset;
-    const visibleLength = resolved.match.selected.graphemes.length;
+    const visibleLength = collapseVisibleText(mapping.selection.text).graphemes.length;
+    validateCaretVisibleOffset(caretVisibleOffset, visibleLength);
     if (deleteDirection === "backward" && caretVisibleOffset === 0) {
       throw new Error("光标前没有可删除的可见字符。");
     }
     if (deleteDirection === "forward" && caretVisibleOffset === visibleLength) {
       throw new Error("光标后没有可删除的可见字符。");
     }
-    const selectedGrapheme = resolved.match.sourceGraphemeStart + (
-      deleteDirection === "backward" ? caretVisibleOffset - 1 : caretVisibleOffset
-    );
-    const localStart = resolved.match.source.starts[selectedGrapheme];
-    const localEnd = resolved.match.source.ends[selectedGrapheme];
+    let localStart: number;
+    let localEnd: number;
+    try {
+      const resolved = resolveManualEditCaret(mapping, caretVisibleOffset);
+      const selectedGrapheme = resolved.match.sourceGraphemeStart + (
+        deleteDirection === "backward" ? caretVisibleOffset - 1 : caretVisibleOffset
+      );
+      localStart = resolved.match.source.starts[selectedGrapheme];
+      localEnd = resolved.match.source.ends[selectedGrapheme];
+    } catch (error) {
+      if (!(error instanceof ManualEditCharacterMatchError) && resolvedCaretOffset === undefined) throw error;
+      const absoluteCaret = resolvedCaretOffset ?? resolveManualEditInsertionOffset(mapping, caretVisibleOffset);
+      const localCaret = absoluteCaret - mapping.startOffset;
+      const adjacent = adjacentEditableLatexRange(mapping.sourceText, localCaret, deleteDirection);
+      if (!adjacent) {
+        throw new Error("光标相邻位置是公式、引用或其他 LaTeX 结构，不能按单个 PDF 字符删除。请编辑源码或选择完整普通文字。");
+      }
+      ({ start: localStart, end: localEnd } = adjacent);
+    }
     startOffset = mapping.startOffset + localStart;
     endOffset = mapping.startOffset + localEnd;
     sourceText = mapping.sourceText.slice(localStart, localEnd);
@@ -478,7 +435,12 @@ export function createPendingCaretManualEdit(
     if (deleteDirection !== undefined) {
       throw new Error("光标插入不能指定删除方向。");
     }
-    startOffset = resolveManualEditInsertionOffset(mapping, caretVisibleOffset);
+    startOffset = resolvedCaretOffset ?? resolveManualEditInsertionOffset(mapping, caretVisibleOffset);
+    const localOffset = startOffset - mapping.startOffset;
+    if (localOffset < 0 || localOffset > mapping.sourceText.length) {
+      throw new Error("后端消歧返回的光标边界超出源码范围。");
+    }
+    validateOrdinaryInsertionPoint(mapping.sourceText, localOffset);
     endOffset = startOffset;
   }
 
@@ -517,7 +479,10 @@ export function validateManualEditRects(
     ) {
       throw new Error("手动修订矩形必须使用 0 至 1 的归一化坐标。");
     }
-    return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    if (rect.page !== undefined && (!Number.isInteger(rect.page) || rect.page < 1 || rect.page > 100_000)) {
+      throw new Error("手动修订矩形页码无效。");
+    }
+    return { ...(rect.page === undefined ? {} : { page: rect.page }), x: rect.x, y: rect.y, width: rect.width, height: rect.height };
   });
 }
 
@@ -920,8 +885,8 @@ function validateOrdinaryInsertionPoint(source: string, offset: number): void {
   }
   if (
     !isGraphemeBoundary(source, offset) ||
+    !isEditableLatexBoundary(source, offset) ||
     isInsideControlSequence(source, offset) ||
-    isUnsafeLatexContext(source, offset) ||
     source[offset - 1] === "\\"
   ) {
     throw new Error("手动编辑插入点位于 LaTeX 命令、注释、数学环境或字符内部。");
@@ -941,7 +906,10 @@ function validateOrdinarySourceFragment(windowText: string, localStart: number, 
   ) {
     throw new Error("手动修订目标截断了 Unicode 字素簇。");
   }
-  if (isInsideControlSequence(windowText, localStart) || isUnsafeLatexContext(windowText, localStart)) {
+  if (
+    isInsideControlSequence(windowText, localStart) ||
+    !isEditableLatexTextRange(windowText, localStart, localStart + fragment.length)
+  ) {
     throw new Error("手动修订目标位于 LaTeX 命令、注释或数学环境中。");
   }
 }
@@ -952,176 +920,6 @@ function isInsideControlSequence(source: string, start: number): boolean {
     index -= 1;
   }
   return index > 0 && source[index - 1] === "\\";
-}
-
-function isUnsafeLatexContext(source: string, until: number): boolean {
-  let braceDepth = 0;
-  let mathMode: "inline" | "display" | "delimiter" | undefined;
-  let comment = false;
-  const environmentStack: LatexEnvironmentFrame[] = [];
-  for (let index = 0; index < until; index += 1) {
-    const activeVerbatim = environmentStack.at(-1);
-    if (activeVerbatim && VERBATIM_ENVIRONMENTS.has(activeVerbatim.normalizedName)) {
-      const closingToken = `\\end{${activeVerbatim.rawName}}`;
-      const closingStart = source.indexOf(closingToken, index);
-      const closingEnd = closingStart < 0 ? -1 : closingStart + closingToken.length;
-      if (closingStart < 0 || closingEnd > until) {
-        return true;
-      }
-      environmentStack.pop();
-      index = closingEnd - 1;
-      continue;
-    }
-
-    const character = source[index];
-    if (comment) {
-      if (character === "\n" || character === "\r") {
-        comment = false;
-      }
-      continue;
-    }
-    if (character === "%") {
-      comment = true;
-      continue;
-    }
-    if (character === "\\") {
-      const verbEnd = findVerbCommandEnd(source, index);
-      if (verbEnd !== undefined) {
-        if (verbEnd === null || verbEnd > until) {
-          return true;
-        }
-        index = verbEnd - 1;
-        continue;
-      }
-
-      const environment = parseEnvironmentCommand(source, index);
-      if (environment) {
-        if (environment.end > until) {
-          return true;
-        }
-        if (environment.kind === "begin") {
-          environmentStack.push({
-            rawName: environment.rawName,
-            normalizedName: normalizeEnvironmentName(environment.rawName)
-          });
-        } else {
-          const active = environmentStack.at(-1);
-          if (!active || active.normalizedName !== normalizeEnvironmentName(environment.rawName)) {
-            return true;
-          }
-          environmentStack.pop();
-        }
-        index = environment.end - 1;
-        continue;
-      }
-
-      const next = source[index + 1];
-      const insideMathEnvironment = environmentStack.some((frame) =>
-        MATH_ENVIRONMENTS.has(frame.normalizedName)
-      );
-      if (!insideMathEnvironment && (next === "(" || next === "[")) {
-        mathMode = "delimiter";
-        index += 1;
-      } else if (!insideMathEnvironment && (next === ")" || next === "]")) {
-        mathMode = undefined;
-        index += 1;
-      } else if (next && !/[A-Za-z@]/u.test(next)) {
-        index += 1;
-      } else {
-        index = skipTexCommand(source, index) - 1;
-      }
-      continue;
-    }
-    const insideMathEnvironment = environmentStack.some((frame) =>
-      MATH_ENVIRONMENTS.has(frame.normalizedName)
-    );
-    if (!insideMathEnvironment && character === "$" && source[index + 1] === "$") {
-      mathMode = mathMode === "display" ? undefined : "display";
-      index += 1;
-      continue;
-    }
-    if (!insideMathEnvironment && character === "$") {
-      mathMode = mathMode === "inline" ? undefined : "inline";
-      continue;
-    }
-    if (character === "{") {
-      braceDepth += 1;
-    } else if (character === "}") {
-      braceDepth -= 1;
-      if (braceDepth < 0) {
-        return true;
-      }
-    }
-  }
-  return comment ||
-    braceDepth !== 0 ||
-    mathMode !== undefined ||
-    environmentStack.some((frame) => isUnsafeEnvironment(frame.normalizedName));
-}
-
-interface LatexEnvironmentFrame {
-  rawName: string;
-  normalizedName: string;
-}
-
-interface LatexEnvironmentCommand {
-  kind: "begin" | "end";
-  rawName: string;
-  end: number;
-}
-
-function parseEnvironmentCommand(source: string, start: number): LatexEnvironmentCommand | undefined {
-  let kind: LatexEnvironmentCommand["kind"];
-  let commandEnd: number;
-  if (source.startsWith("\\begin", start) && !/[A-Za-z@]/u.test(source[start + 6] ?? "")) {
-    kind = "begin";
-    commandEnd = start + 6;
-  } else if (source.startsWith("\\end", start) && !/[A-Za-z@]/u.test(source[start + 4] ?? "")) {
-    kind = "end";
-    commandEnd = start + 4;
-  } else {
-    return undefined;
-  }
-
-  const groupStart = skipWhitespace(source, commandEnd);
-  if (source[groupStart] !== "{") {
-    return undefined;
-  }
-  const groupEnd = source.indexOf("}", groupStart + 1);
-  if (groupEnd < 0) {
-    return undefined;
-  }
-  const rawName = source.slice(groupStart + 1, groupEnd).trim();
-  if (rawName.length === 0 || /[{}\\\r\n]/u.test(rawName)) {
-    return undefined;
-  }
-  return { kind, rawName, end: groupEnd + 1 };
-}
-
-function findVerbCommandEnd(source: string, start: number): number | null | undefined {
-  if (!source.startsWith("\\verb", start) || /[A-Za-z@]/u.test(source[start + 5] ?? "")) {
-    return undefined;
-  }
-  let delimiterIndex = start + 5;
-  if (source[delimiterIndex] === "*") {
-    delimiterIndex += 1;
-  }
-  const delimiter = source[delimiterIndex];
-  if (!delimiter || /\s/u.test(delimiter)) {
-    return null;
-  }
-  const closing = source.indexOf(delimiter, delimiterIndex + 1);
-  return closing < 0 ? null : closing + 1;
-}
-
-function normalizeEnvironmentName(value: string): string {
-  return value.trim().toLocaleLowerCase("en-US").replace(/\*$/u, "");
-}
-
-function isUnsafeEnvironment(normalizedName: string): boolean {
-  return MATH_ENVIRONMENTS.has(normalizedName) ||
-    TABLE_ENVIRONMENTS.has(normalizedName) ||
-    VERBATIM_ENVIRONMENTS.has(normalizedName);
 }
 
 interface CollapsedText {

@@ -9,6 +9,7 @@ interface RunOptions {
   input?: string;
   timeoutMs?: number;
   onOutput?: (text: string) => void;
+  signal?: AbortSignal;
 }
 
 const executableCache = new Map<string, string>();
@@ -97,6 +98,12 @@ export function runProcess(command: string, args: string[], options: RunOptions)
     let timedOut = false;
     let settled = false;
     let forcedSettlement: NodeJS.Timeout | undefined;
+    const abort = (): void => {
+      terminateProcessTree(child);
+      forcedSettlement ??= setTimeout(() => {
+        finish({ code: null, stdout, stderr, timedOut: false });
+      }, 5_000);
+    };
     const finish = (result: ProcessResult): void => {
       if (settled) {
         return;
@@ -106,6 +113,7 @@ export function runProcess(command: string, args: string[], options: RunOptions)
       if (forcedSettlement) {
         clearTimeout(forcedSettlement);
       }
+      options.signal?.removeEventListener("abort", abort);
       resolve(result);
     };
     const timeout = setTimeout(() => {
@@ -133,12 +141,17 @@ export function runProcess(command: string, args: string[], options: RunOptions)
         if (forcedSettlement) {
           clearTimeout(forcedSettlement);
         }
+        options.signal?.removeEventListener("abort", abort);
         reject(error);
       }
     });
     child.on("close", (code) => {
       finish({ code, stdout, stderr, timedOut });
     });
+    options.signal?.addEventListener("abort", abort, { once: true });
+    if (options.signal?.aborted) {
+      abort();
+    }
     child.stdin.on("error", (error: NodeJS.ErrnoException) => {
       if (error.code !== "EPIPE" && error.code !== "ERR_STREAM_DESTROYED") {
         stderr += `\n标准输入写入失败：${error.message}`;

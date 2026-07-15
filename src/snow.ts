@@ -127,7 +127,7 @@ class SnowAcpClient {
           fs: { readTextFile: false, writeTextFile: false },
           terminal: false
         },
-        clientInfo: { name: "circletex", title: "CircleTeX", version: "0.7.3" }
+        clientInfo: { name: "circletex", title: "CircleTeX", version: "0.8.2" }
       }), "Snow ACP 初始化响应");
       if (initializeResult.protocolVersion !== ACP_PROTOCOL_VERSION) {
         throw new Error("Snow CLI 返回了不兼容的 ACP 协议版本。");

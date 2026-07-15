@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="media/circletex-activity.svg" alt="CircleTeX" width="96" />
-</p>
-
 <h1 align="center">CircleTeX</h1>
 
 <p align="center">
@@ -12,7 +8,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/VS%20Code-^1.95.0-blue?logo=visualstudiocode" alt="VS Code" />
-  <img src="https://img.shields.io/badge/version-0.7.3-brightgreen" alt="Version" />
+  <img src="https://img.shields.io/badge/version-0.8.4-brightgreen" alt="Version" />
   <img src="https://img.shields.io/badge/platform-Windows-lightgrey?logo=windows" alt="Platform" />
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License" />
 </p>
@@ -44,10 +40,15 @@
 ## ✨ 核心功能 / Core Features
 
 ### 📝 PDF 直接编辑 / Direct PDF Editing
-- **铅笔工具**：拖选 PDF 文字后直接键入替换、`Backspace`/`Delete` 删除、单击插入
+- 工具栏将**处理方式**与**选择方式**分开：上下切换“直编 / Agent”，右侧独立选择文字光标或区域框选
+- 文字与区域工具均可再次单击关闭；关闭后保留 PDF 原生文字选择用于复制，但不触发 CircleTeX 定位
+- **文字工具**：拖选 PDF 文字后直接键入替换、`Backspace`/`Delete` 删除、单击插入
+- **跨页文字选择**：连续选择最多 12 页，可交给 Agent，或作为一项原子直接编辑整体替换、删除
+- **区域工具**：框选连续普通正文后替换或删除整个区域；离散片段和不安全结构自动拒绝
 - **中文输入法**完整支持，`Ctrl+Enter` 提交、`Esc` 取消
 - **撤销 / 重做**：`Ctrl+Z` / `Ctrl+Y`，支持批量操作
-- 公式、表格、注释环境**自动保护**，拒绝不安全编辑
+- 支持在行内公式、引用两侧及 `\\textbf`、`\\emph` 等格式正文中直接编辑
+- 公式内部、未知命令、表格和注释环境**自动保护**，拒绝不安全编辑
 
 ### 🤖 AI 助手 / AI Assistant
 - 选中段落，输入修改要求（如"把这段改写得更正式"），AI 生成候选修订
@@ -55,10 +56,17 @@
 - **结构化差异预览**：候选修改在 VS Code 原生 Diff 视图中对比，确认后写入
 - AI 运行在**只读沙箱**中，不接触文件系统
 
+### 🧩 外部 Skill 任务
+- 在左侧 **外部 Skill** 视图导入包含 `SKILL.md` 的本地目录，由 CircleTeX 保存内容哈希快照并管理启用状态
+- 导入或更新时确认任务类型、作用范围、输入快照、输出扩展名、声明命令与超时；内容或权限变化后重新授权
+- 在审阅窗口的现有任务选择框中切换“局部修订”或已导入 Skill，整篇任务不要求 PDF 选区
+- Skill 仅对论文副本运行，首版支持**分析任务**和**独立产物**，不允许直接修改或编译真实 `main.tex` / `main.pdf`
+- 首版仅支持 Codex；选择 Snow 时在执行前明确拦截。产物发布到 `exports/circletex/<skill>/<时间戳>/`，完成后只显示列表
+
 ### 🔄 SyncTeX 智能定位 / Smart SyncTeX Mapping
 - PDF 选区自动映射到 `main.tex` 源行范围
 - 重复短语通过**左右上下文消歧** + SyncTeX 空间位置复核
-- 区域框选工具支持**矩形选定 + 多点锚定**，始终强制人工确认
+- 区域框选工具支持**矩形选定 + 多点锚定 + 有序文字片段**；Agent 模式要求人工确认，直接编辑在提交时执行严格连续性校验
 
 ### ⚡ 安全编译 / Safe Compilation
 - 隔离临时目录预检 → XeLaTeX 编译 → 产物发布 → PDF 刷新
@@ -70,6 +78,7 @@
 - 使用内置 PDF.js 连续滚动渲染
 - `Ctrl+滚轮` 缩放、页码跳转、适合宽度
 - 虚拟页面管理，长文档低内存占用
+- 优先显示上次稳定页缓存或低清首屏，高清页面与文字选择层在后台分阶段接管
 
 ---
 
@@ -78,7 +87,7 @@
 ### 安装 / Installation
 
 ```powershell
-code --install-extension .\circletex-0.7.3.vsix --force
+code --install-extension .\circletex-0.9.1.vsix --force
 ```
 
 ### 使用 / Usage
@@ -87,10 +96,28 @@ code --install-extension .\circletex-0.7.3.vsix --force
 2. 在左侧"设置"中选择编辑模式（推荐 **直接编辑**）
 3. 运行 `CircleTeX：编译论文` 生成带 SyncTeX 信息的 `main.pdf`
 4. 运行 `CircleTeX：打开 PDF 审阅`
-5. 点击**铅笔图标**，在 PDF 上直接增删改文字
+5. 在工具栏上方选择“直编”，再使用文字或区域工具增删改 PDF 正文；区域框选图片后可用上下箭头调整尺寸
 6. 点击 **应用 N 项并编译**，修改写回源码并重新编译
 
-> 需要 AI 帮助？退出铅笔模式，在底部输入框写要求，点击 **当前助手分析**。
+### 调整图片尺寸
+
+1. 切换到“直编”和“区域框选”；
+2. 粗略框住单张图片主体，CircleTeX 会自动吸附到 PDF 中的真实图片盒子，并排除图注；
+3. 灰色虚线表示原始图片边界，蓝色实线表示候选边界；使用 `↑` 或 `↓` 按 5% 调整；
+4. 点击“确认”只会加入待编译队列，PDF 和 `main.tex` 尚未变化；
+5. 点击现有的 **应用 N 项并编译**，统一写入图片参数并刷新 PDF。
+
+首版支持普通 `includegraphics` 的单一 `width`、`height` 或 `scale`，以及 `width=\linewidth` 的简单 `subfigure`。复杂动态表达式、多重尺寸、TikZ/PGFPlots、自定义图片宏和无法唯一定位的相邻图片会安全拒绝。
+
+> 需要 AI 帮助？切换到“Agent”，选择文字或区域后在底部输入要求，点击 **当前助手分析**。
+
+### 运行外部 Skill
+
+1. 在左侧 CircleTeX 的 **外部 Skill** 视图点击导入按钮，选择包含 `SKILL.md` 的目录
+2. 核对静态检查结果并确认权限清单
+3. 在 PDF 审阅底部的“任务”选择框中选择该 Skill
+4. 输入任务要求并交给 Codex 执行；可复用同一按钮取消任务
+5. 在完成后的产物列表中主动打开文件，或从左侧查看任务历史
 
 ---
 
@@ -140,9 +167,14 @@ code --install-extension .\circletex-0.7.3.vsix --force
 
 - 未受信任工作区中**不运行外部进程、不写文件**
 - AI 助手运行在**只读沙箱**（Codex）或**隔离临时目录**（Snow），禁用文件系统与终端
+- 外部 Skill 使用独立临时任务目录和 `workspace-write` Codex Runner；只向 Runner 提供论文与 Skill 的复制快照
+- CircleTeX 在运行后复核输入、Skill 和任务清单哈希，只发布经过扩展名、路径、数量、大小和结构校验的产物
+- 网络在 CircleTeX 权限模型中固定为禁止，首版不提供联网授权；Skill 内容或权限变化时必须重新确认
 - 所有修改**必须人工确认**后才能写入
 - 源码自动备份，编译失败自动回滚
 - 提示词和论文正文**不写入扩展日志**
+
+> 隔离边界：`workspace-write` 主要限制 Codex 的写入范围。CircleTeX 不向 Runner 提供真实项目路径，也不会使用额外目录授权，并在执行后进行哈希复核；但当前没有官方证据可将其表述为操作系统级的绝对读取隔离。请仅导入来源可信、已核对内容的 Skill。
 
 ---
 
@@ -160,7 +192,7 @@ npm run package # 打包 VSIX（自动运行完整验证）
 
 ## 📄 许可证 / License
 
-MIT License — 详见 [LICENSE.txt](LICENSE.txt)
+MIT License — 详见 `LICENSE.txt`
 
 ---
 

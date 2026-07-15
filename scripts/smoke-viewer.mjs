@@ -8,6 +8,7 @@ import { chromium } from "playwright-core";
 const root = process.cwd();
 const pdfPath = path.resolve(root, "..", "main.pdf");
 const edgePath = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+const previewJpeg = Buffer.from("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABAf/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPxB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPxB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxB//9k=", "base64");
 await mkdir(path.join(root, "artifacts"), { recursive: true });
 const smokeGraphemeSegmenter = new Intl.Segmenter("und", { granularity: "grapheme" });
 const smokeGraphemes = (value) => [...smokeGraphemeSegmenter.segment(value)].map(({ segment }) => segment);
@@ -35,13 +36,17 @@ const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><met
       <div class="manual-edit-actions"><button id="manual-insert-before" class="secondary-button" disabled>前插</button><button id="manual-insert-after" class="secondary-button" disabled>后插</button><button id="manual-replace" class="secondary-button" disabled>替换</button><button id="manual-delete" class="secondary-button" disabled>删除</button></div>
       <div class="manual-edit-history"><span id="pending-edit-count">0 项待提交</span><button id="manual-undo" class="icon-button" disabled>↶</button><button id="manual-clear" class="icon-button" disabled>×</button><button id="manual-accept-all" class="secondary-button" hidden>接受全部</button><button id="manual-reject-all" class="secondary-button" hidden>拒绝全部</button></div>
     </div>
-    <div class="prompt-bar"><div class="analysis-row"><textarea id="instruction" maxlength="4000" disabled></textarea><button id="analyze" class="primary-button" disabled>交给 AI 助手分析</button></div><div class="prompt-actions"><button id="manual-handoff" class="secondary-button" hidden>复制任务并打开 AI 助手</button><div id="candidate-actions" class="candidate-actions" hidden><button id="show-diff" class="secondary-button">查看差异</button><button id="apply" class="primary-button">应用并保存</button><button id="discard" class="secondary-button">放弃</button></div></div></div>
+    <div class="prompt-bar"><div class="task-selector-row"><label for="task-mode">任务</label><select id="task-mode"><option value="revision">局部修订</option></select><span id="task-scope-note">需要 PDF 选区</span></div><div class="analysis-row"><textarea id="instruction" maxlength="4000" disabled></textarea><button id="analyze" class="primary-button" disabled>交给 AI 助手分析</button></div><div class="prompt-actions"><button id="manual-handoff" class="secondary-button" hidden>复制任务并打开 AI 助手</button><div id="candidate-actions" class="candidate-actions" hidden><button id="show-diff" class="secondary-button">查看差异</button><button id="apply" class="primary-button">应用并保存</button><button id="discard" class="secondary-button">放弃</button></div></div></div>
+    <div id="skill-artifacts" class="skill-artifacts" hidden></div>
     <div id="compile-progress" class="compile-progress" hidden><div class="compile-progress-meta"><span id="compile-progress-label">准备编译</span><span id="compile-progress-value">0%</span></div><div id="compile-progress-track" class="compile-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="compile-progress-fill" class="compile-progress-fill"></div></div></div>
     <div class="status-line"><span id="candidate-summary" hidden></span><span id="status"></span></div>
   </section>
 </main>
-<script>window.__messages=[];window.acquireVsCodeApi=()=>({postMessage:m=>window.__messages.push(m),getState:()=>({pageNumber:1,fitMode:true}),setState:s=>window.__savedState=s});</script>
-<script id="circletex-config" type="application/json">${JSON.stringify({pdfUri:"/main.pdf",pdfJsUri:"/media/pdfjs/pdf.min.mjs",workerUri:"/media/pdfjs/pdf.worker.min.mjs",cMapUri:"/media/pdfjs/cmaps/",standardFontsUri:"/media/pdfjs/standard_fonts/"})}</script><script type="module" src="/media/viewer.js"></script></body></html>`;
+<script>
+window.__messages=[];window.__startupPreviewEvents=[];window.acquireVsCodeApi=()=>({postMessage:m=>window.__messages.push(m),getState:()=>({pageNumber:1,fitMode:true}),setState:s=>window.__savedState=s});
+new MutationObserver(()=>{const immediate=document.querySelector(".startup-preview-overlay");if(immediate&&!window.__startupPreviewShown){window.__startupPreviewShown=true;window.__startupPreviewEvents.push({type:"shown",pageShells:document.querySelectorAll(".pdf-page").length});}if(window.__startupPreviewShown&&!immediate&&!window.__startupPreviewRemoved){window.__startupPreviewRemoved=true;window.__startupPreviewEvents.push({type:"immediateRemoved"});}if(window.__startupPreviewShown&&document.querySelector(".pdf-page canvas")&&!document.querySelector(".page-refresh-snapshot")&&!window.__startupSnapshotRemoved){window.__startupSnapshotRemoved=true;window.__startupPreviewEvents.push({type:"snapshotRemoved"});}}).observe(document.documentElement,{childList:true,subtree:true});
+</script>
+<script id="circletex-config" type="application/json">${JSON.stringify({pdfUri:"/main.pdf",pdfJsUri:"/media/pdfjs/pdf.min.mjs",workerUri:"/media/pdfjs/pdf.worker.min.mjs",cMapUri:"/media/pdfjs/cmaps/",standardFontsUri:"/media/pdfjs/standard_fonts/",pdfFingerprint:"smoke",previewKey:"0123456789abcdef0123456789abcdef01234567",preview:{uri:"/preview.jpg",page:1,widthPt:595,heightPt:842},extensionCreatedAt:Date.now()})}</script><script type="module" src="/media/viewer.js"></script></body></html>`;
 
 async function findVisibleTextBox(page) {
   return page.evaluate(() => {
@@ -127,6 +132,53 @@ async function selectVisibleTextForDirectEdit(page, length = 6) {
   }, length);
   await page.waitForFunction((count) => window.__messages.filter((message) => message.type === "selection").length > count, before);
   return page.evaluate(() => window.__messages.findLast((message) => message.type === "selection"));
+}
+
+async function selectAcrossRenderedPages(page) {
+  const before = await page.evaluate(() => window.__messages.filter((message) => message.type === "selection").length);
+  const pages = await page.evaluate(() => {
+    const records = [...document.querySelectorAll(".pdf-page")];
+    const textNodes = (layer, order) => {
+      const shellRect = layer.closest(".pdf-page").getBoundingClientRect();
+      const values = [];
+      const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const node = walker.currentNode;
+        const first = node.textContent.search(/\S/u);
+        if (first < 0) continue;
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const rect = range.getBoundingClientRect();
+        const center = (rect.top + rect.height / 2 - shellRect.top) / Math.max(1, shellRect.height);
+        if (rect.width > 2 && rect.height > 2 && center >= 0.12 && center <= 0.88) {
+          values.push({ node, first });
+        }
+      }
+      return order === "last" ? values.at(-1) : values[0];
+    };
+    for (let index = 0; index < records.length - 1; index += 1) {
+      const firstLayer = records[index].querySelector(".textLayer");
+      const secondLayer = records[index + 1].querySelector(".textLayer");
+      if (!firstLayer || !secondLayer) continue;
+      const start = textNodes(firstLayer, "last");
+      const end = textNodes(secondLayer, "first");
+      if (!start || !end) continue;
+      const range = document.createRange();
+      range.setStart(start.node, start.first);
+      range.setEnd(end.node, Math.min(end.node.textContent.length, end.first + 6));
+      const selection = getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.getElementById("pages").dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+      return [Number(records[index].dataset.pageNumber), Number(records[index + 1].dataset.pageNumber)];
+    }
+    throw new Error("没有找到两个已渲染的相邻页面用于跨页选区烟测。");
+  });
+  await page.waitForFunction((count) => window.__messages.filter((message) => message.type === "selection").length > count, before);
+  return {
+    pages,
+    selection: await page.evaluate(() => window.__messages.findLast((message) => message.type === "selection"))
+  };
 }
 
 async function clickVisibleTextForDirectEdit(page) {
@@ -221,8 +273,11 @@ async function mapSmokeSelection(page, selection, suffix, requiresConfirmation =
       requestId: selection.requestId,
       sessionId,
       mappingId,
-      selectionKind: "text",
+      selectionKind: selection.selectionKind,
+      interactionMode: selection.interactionMode,
+      interactionVersion: selection.interactionVersion,
       page: selection.page,
+      endPage: selection.pageFragments?.at(-1)?.page ?? selection.page,
       selectionLength: selection.text.length,
       startLine: 300,
       endLine: 302,
@@ -245,6 +300,10 @@ const server = createServer(async (request, response) => {
     }
     if (url.pathname === "/main.pdf") {
       file = pdfPath;
+    } else if (url.pathname === "/preview.jpg") {
+      response.writeHead(200, { "Content-Type": "image/jpeg", "Cache-Control": "no-store" });
+      response.end(previewJpeg);
+      return;
     } else if (url.pathname.startsWith("/media/")) {
       file = path.join(root, url.pathname.slice(1));
       if (!path.resolve(file).startsWith(path.join(root, "media"))) {
@@ -278,6 +337,18 @@ try {
     return total >= 2 && document.querySelectorAll(".pdf-page").length === total;
   });
   await page.waitForFunction(() => document.querySelectorAll(".pdf-page canvas").length >= 1);
+  await page.waitForFunction(() => document.querySelector('.pdf-page[data-render-stage="text"]'));
+  await page.waitForFunction(() => window.__startupPreviewEvents.some((event) => event.type === "snapshotRemoved"));
+  const startupPreviewEvents = await page.evaluate(() => window.__startupPreviewEvents);
+  assert.deepEqual(startupPreviewEvents.map((event) => event.type), ["shown", "immediateRemoved", "snapshotRemoved"]);
+  assert.equal(startupPreviewEvents[0].pageShells, 0, "缓存预览必须先于 PDF 页面壳体显示。");
+  assert.equal(await page.locator(".startup-preview-overlay, .page-refresh-snapshot").count(), 0, "高清 Canvas 完成后必须移除缓存预览。");
+  await page.waitForFunction(() => window.__messages.some((message) =>
+    message.type === "cachePdfPreview" &&
+    typeof message.dataUrl === "string" &&
+    message.dataUrl.startsWith("data:image/jpeg;base64,") &&
+    message.dataUrl.length < 1_500_000
+  ));
   const totalPages = await page.locator(".pdf-page").count();
   assert.ok(totalPages >= 2);
   assert.ok((await page.locator(".pdf-page canvas").count()) <= 5);
@@ -286,6 +357,42 @@ try {
   })));
   assert.equal(await page.locator("#analyze").textContent(), "交给 Snow CLI 分析");
   assert.equal(await page.locator("#manual-handoff").textContent(), "复制任务并打开 Snow CLI");
+  assert.equal(await page.locator("#interaction-mode").count(), 1);
+  assert.equal(await page.locator("#mode-agent").getAttribute("aria-pressed"), "true");
+  assert.equal(await page.locator("#mode-direct").getAttribute("aria-pressed"), "false");
+  assert.equal(await page.locator("#direct-edit").getAttribute("aria-pressed"), "true");
+  assert.equal(await page.locator("#region-select").getAttribute("aria-pressed"), "false");
+  await page.locator("#direct-edit").click();
+  assert.equal(await page.locator("#direct-edit").getAttribute("aria-pressed"), "false");
+  assert.equal(await page.locator("#region-select").getAttribute("aria-pressed"), "false");
+  const disabledToolSelectionCount = await page.evaluate(() => window.__messages.filter((message) => message.type === "selection").length);
+  await page.evaluate(() => {
+    const node = [...document.querySelectorAll(".textLayer")].flatMap((layer) => {
+      const values = [];
+      const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) values.push(walker.currentNode);
+      return values;
+    }).find((item) => item.textContent.trim().length >= 4);
+    const range = document.createRange();
+    range.setStart(node, 0);
+    range.setEnd(node, Math.min(4, node.textContent.length));
+    getSelection().removeAllRanges();
+    getSelection().addRange(range);
+    document.getElementById("pages").dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+  });
+  await page.waitForTimeout(40);
+  assert.equal(await page.evaluate(() => window.__messages.filter((message) => message.type === "selection").length), disabledToolSelectionCount);
+  assert.ok((await page.evaluate(() => getSelection().toString())).length > 0, "工具关闭后应保留原生文字复制选择。");
+  await page.locator("#direct-edit").click();
+  assert.equal(await page.locator("#direct-edit").getAttribute("aria-pressed"), "true");
+  await page.locator("#region-select").click();
+  assert.equal(await page.locator("#region-select").getAttribute("aria-pressed"), "true");
+  await page.locator("#region-select").click();
+  assert.equal(await page.locator("#region-select").getAttribute("aria-pressed"), "false");
+  assert.equal(await page.locator("#direct-edit").getAttribute("aria-pressed"), "false");
+  await page.locator("#direct-edit").click();
+  assert.equal(await page.locator(".prompt-bar").isHidden(), false);
+  assert.equal(await page.locator("#manual-edit-bar").isHidden(), true);
   const desktopAnalysisLayout = await page.locator(".analysis-row").evaluate((row) => {
     const input = row.querySelector("#instruction").getBoundingClientRect();
     const button = row.querySelector("#analyze").getBoundingClientRect();
@@ -302,6 +409,19 @@ try {
     desktopAnalysisLayout.buttonTop >= desktopAnalysisLayout.inputTop - 1 &&
     desktopAnalysisLayout.buttonTop < desktopAnalysisLayout.inputBottom
   );
+  await page.evaluate(() => window.dispatchEvent(new MessageEvent("message", {
+    data: {
+      type: "skillsChanged",
+      skills: [{ id: "paper-export", name: "论文导出", scope: "document", taskType: "artifact" }]
+    }
+  })));
+  await page.locator("#task-mode").selectOption("skill:paper-export");
+  await page.locator("#instruction").fill("生成论文导出产物");
+  assert.equal(await page.locator("#task-scope-note").textContent(), "整篇论文");
+  assert.equal(await page.locator("#analyze").textContent(), "交给 Snow CLI 执行");
+  assert.equal(await page.locator("#analyze").isEnabled(), true);
+  await page.locator("#instruction").fill("");
+  await page.locator("#task-mode").selectOption("revision");
   await page.evaluate(() => {
     window.dispatchEvent(new MessageEvent("message", { data: { type: "manualEditsState", edits: [], count: 0, queueVersion: 7 } }));
     window.dispatchEvent(new MessageEvent("message", { data: { type: "trackedRevisionsState", hasTrackedRevisions: false } }));
@@ -329,6 +449,15 @@ try {
         layer.querySelectorAll("span").length > 3;
     });
   }, undefined, { timeout: 15_000 });
+
+  const crossPageAgent = await selectAcrossRenderedPages(page);
+  assert.equal(crossPageAgent.selection.selectionKind, "text");
+  assert.deepEqual(crossPageAgent.selection.pageFragments.map((fragment) => fragment.page), crossPageAgent.pages);
+  assert.equal(crossPageAgent.selection.page, crossPageAgent.pages[0]);
+  assert.equal(crossPageAgent.selection.end.page, undefined);
+  assert.ok(crossPageAgent.selection.pageFragments.every((fragment) => fragment.text.trim().length > 0));
+  assert.ok((await page.locator("#selection-summary").textContent()).includes("跨页文字选区"));
+  await page.locator("#clear-selection").click();
 
   await page.evaluate(() => {
     const viewerRect = document.getElementById("viewer").getBoundingClientRect();
@@ -394,9 +523,14 @@ try {
   await page.waitForFunction(() => window.__messages.some((message) => message.type === "confirmRange"));
   await page.evaluate(() => window.dispatchEvent(new MessageEvent("message", { data: { type: "rangeConfirmed", sessionId: "session_test", mappingId: "mapping_test" } })));
   assert.equal(await page.locator("#analyze").isDisabled(), false);
-  assert.equal(await page.locator("#manual-text").isDisabled(), false);
   await page.evaluate(() => window.dispatchEvent(new MessageEvent("message", { data: { type: "busy", action: "analyze", sessionId: "session_old", mappingId: "mapping_old", message: "过期分析" } })));
   assert.equal(await page.locator("#analyze").isDisabled(), false);
+  await page.locator("#mode-direct").click();
+  assert.equal(await page.locator("#mode-direct").getAttribute("aria-pressed"), "true");
+  assert.equal(await page.locator("#direct-edit").getAttribute("aria-pressed"), "true");
+  assert.equal(await page.locator(".prompt-bar").isHidden(), true);
+  assert.equal(await page.locator("#manual-edit-bar").isHidden(), false);
+  assert.equal(await page.locator("#manual-text").isDisabled(), false);
 
   await page.locator("#manual-text").fill("竞态恢复检查");
   await page.locator("#manual-insert-before").click();
@@ -585,6 +719,7 @@ try {
   assert.ok(pixels.light > 0, "可见 PDF 页面缺少纸张亮色像素。");
   assert.ok(pixels.dark > 0, "可见 PDF 页面缺少正文暗色像素。");
 
+  await page.locator("#mode-agent").click();
   await page.evaluate(() => window.dispatchEvent(new MessageEvent("message", { data: { type: "candidate", sessionId: "session_test", mappingId: "mapping_test", candidateId: "candidate_test", summary: "已生成局部建议" } })));
   assert.equal(await page.locator("#candidate-actions").isHidden(), false);
   assert.equal((await page.locator("body").textContent()).includes("replacement"), false);
@@ -660,6 +795,7 @@ try {
   assert.equal(await page.locator(".manual-edit-overlay").count(), 1);
   assert.equal(await page.locator("#compile").textContent(), "应用 3 项并编译");
 
+  await page.locator("#mode-direct").click();
   await page.locator("#manual-clear").click();
   await page.waitForFunction(() => window.__messages.some((message) => message.type === "clearManualEdits"));
   const clearMessage = await page.evaluate(() => window.__messages.findLast((message) => message.type === "clearManualEdits"));
@@ -689,6 +825,9 @@ try {
   await page.evaluate(() => window.dispatchEvent(new MessageEvent("message", { data: { type: "trackedRevisionsState", hasTrackedRevisions: false } })));
   assert.equal(await page.locator("#manual-reject-all").isHidden(), true);
 
+  await page.locator("#mode-agent").click();
+  assert.equal(await page.locator("#mode-agent").getAttribute("aria-pressed"), "true");
+  assert.equal(await page.locator("#direct-edit").getAttribute("aria-pressed"), "true");
   await page.locator("#page-number").fill("6");
   await page.locator("#page-number").dispatchEvent("change");
   await page.waitForFunction(() => {
@@ -711,6 +850,13 @@ try {
   assert.ok(regionMessage.text.trim().length >= 4);
   assert.ok(regionMessage.bounds.width > 0 && regionMessage.bounds.height > 0);
   assert.ok(regionMessage.anchors.length >= 1 && regionMessage.anchors.length <= 16);
+  assert.ok(regionMessage.fragments.length >= 1 && regionMessage.fragments.length <= 64);
+  assert.equal(regionMessage.interactionMode, "agent");
+  assert.ok(Number.isInteger(regionMessage.interactionVersion));
+  assert.ok(regionMessage.fragments.every((fragment, index) =>
+    fragment.text.trim().length > 0 && fragment.rects.length >= 1 &&
+    (index === 0 || fragment.lineIndex >= regionMessage.fragments[index - 1].lineIndex)
+  ));
   const regionPoints = [regionMessage.start, ...regionMessage.anchors, regionMessage.end];
   assert.ok(regionPoints.every((point) =>
     point.x >= regionMessage.bounds.x && point.x <= regionMessage.bounds.x + regionMessage.bounds.width &&
@@ -746,7 +892,8 @@ try {
     start: regionMessage.start,
     end: regionMessage.end,
     bounds: regionMessage.bounds,
-    anchors: regionMessage.anchors
+    anchors: regionMessage.anchors,
+    fragments: regionMessage.fragments
   }, 20);
   assert.equal(regionMapping.requiresConfirmation, true);
   assert.ok(regionMapping.startLine >= 1 && regionMapping.endLine >= regionMapping.startLine);
@@ -856,10 +1003,12 @@ try {
   await page.keyboard.press("Escape");
   await page.waitForFunction(() => document.querySelectorAll(".region-selection-overlay").length === 0);
   assert.equal(await page.locator("#selection-details").isHidden(), true);
-  await page.locator("#region-select").click();
-  assert.equal(await page.locator("#region-select").getAttribute("aria-pressed"), "false");
+  assert.equal(await page.locator("#region-select").getAttribute("aria-pressed"), "true");
 
   assert.equal(await page.locator("#direct-edit").count(), 1);
+  await page.locator("#mode-direct").click();
+  assert.equal(await page.locator("#mode-direct").getAttribute("aria-pressed"), "true");
+  assert.equal(await page.locator("#region-select").getAttribute("aria-pressed"), "true");
   await page.locator("#direct-edit").click();
   assert.equal(await page.locator("#direct-edit").getAttribute("aria-pressed"), "true");
   assert.equal(await page.locator("#region-select").getAttribute("aria-pressed"), "false");
@@ -875,11 +1024,115 @@ try {
   assert.equal(await page.locator(".direct-edit-draft-overlay").count(), 0);
 
   const directEdits = [];
+  await page.locator("#region-select").click();
+  assert.equal(await page.locator("#region-select").getAttribute("aria-pressed"), "true");
+  await page.locator("#page-number").fill("9");
+  await page.locator("#page-number").press("Enter");
+  await page.waitForFunction(() => Number(document.querySelector('.pdf-page[data-page-number="9"]')?.dataset.imageCount) >= 1);
+  const imageBox = await page.locator('.pdf-page[data-page-number="9"]').evaluate((shell) => {
+    const boundary = JSON.parse(shell.dataset.imageBoundaries)[0];
+    const shellRect = shell.getBoundingClientRect();
+    const scaleX = shellRect.width / Number.parseFloat(shell.style.width) * (Number.parseFloat(shell.style.width) / 595.28);
+    const scaleY = shellRect.height / Number.parseFloat(shell.style.height) * (Number.parseFloat(shell.style.height) / 841.89);
+    return {
+      page: 9,
+      left: shellRect.left + (boundary.x + boundary.width * 0.1) * scaleX,
+      right: shellRect.left + (boundary.x + boundary.width * 0.9) * scaleX,
+      top: shellRect.top + (boundary.y + boundary.height * 0.1) * scaleY,
+      bottom: shellRect.top + (boundary.y + boundary.height * 0.9) * scaleY,
+      boundary
+    };
+  });
+  const locateImageCount = await page.evaluate(() => window.__messages.filter((message) => message.type === "locateImage").length);
+  await page.evaluate((pageNumber) => {
+    const layer = document.querySelector(`.pdf-page[data-page-number="${pageNumber}"] .textLayer`);
+    window.__imageSmokeTextLayer = layer.cloneNode(true);
+    layer.replaceChildren();
+  }, imageBox.page);
+  await page.mouse.move(imageBox.left, imageBox.top);
+  await page.mouse.down();
+  await page.mouse.move(imageBox.right, imageBox.bottom, { steps: 5 });
+  await page.mouse.up();
+  await page.waitForFunction((count) => window.__messages.filter((message) => message.type === "locateImage").length > count, locateImageCount);
+  const locateImage = await page.evaluate(() => window.__messages.findLast((message) => message.type === "locateImage"));
+  await page.evaluate((pageNumber) => {
+    const layer = document.querySelector(`.pdf-page[data-page-number="${pageNumber}"] .textLayer`);
+    layer.replaceChildren(...window.__imageSmokeTextLayer.cloneNode(true).childNodes);
+    delete window.__imageSmokeTextLayer;
+  }, imageBox.page);
+  assert.equal(locateImage.anchors.length, 9);
+  assert.ok(locateImage.bounds.width > 0 && locateImage.bounds.height > 0);
+  assert.equal(locateImage.imageObjectName, imageBox.boundary.objectName);
+  assert.deepEqual(locateImage.bounds, imageBox.boundary);
+  assert.notDeepEqual(locateImage.roughBounds, locateImage.bounds);
+  assert.equal(await page.locator(".region-selection-outline-image").count(), 1);
+  assert.equal(await page.locator(".region-selection-rough").count(), 1);
+  await page.evaluate(({ requestId, pageNumber, bounds, roughBounds, pageWidth, pageHeight, imageObjectName }) => {
+    window.dispatchEvent(new MessageEvent("message", { data: {
+      type: "imageEditTarget",
+      requestId,
+      targetId: "image-target-smoke",
+      page: pageNumber,
+      rects: [{ page: pageNumber, x: bounds.x / pageWidth, y: bounds.y / pageHeight, width: bounds.width / pageWidth, height: bounds.height / pageHeight }],
+      imagePath: "figures/Fig01.png",
+      originalValue: "width=0.58\\textwidth",
+      roughBounds,
+      snappedBounds: bounds,
+      pageWidth,
+      pageHeight,
+      imageObjectName,
+      factor: 1
+    } }));
+  }, { requestId: locateImage.requestId, pageNumber: locateImage.page, bounds: locateImage.bounds, roughBounds: locateImage.roughBounds, pageWidth: locateImage.pageWidth, pageHeight: locateImage.pageHeight, imageObjectName: locateImage.imageObjectName });
+  assert.equal(await page.locator(".region-selection-overlay").count(), 0);
+  assert.equal(await page.locator(".image-edit-controls").count(), 1);
+  assert.equal(await page.locator(".image-edit-original").count(), 1);
+  assert.equal(await page.locator(".image-edit-preview").count(), 1);
+  assert.equal(await page.locator('.image-edit-controls button[aria-label="图片放大 5%"]').count(), 1);
+  await page.locator('.image-edit-controls button[aria-label="图片放大 5%"]').click();
+  assert.match(await page.locator(".image-edit-value").textContent(), /105%/u);
+  await page.locator(".image-edit-controls button", { hasText: "确认" }).click();
+  const queueImage = await page.evaluate(() => window.__messages.findLast((message) => message.type === "queueImageEdit"));
+  assert.equal(queueImage.targetId, "image-target-smoke");
+  assert.equal(queueImage.factor, 1.05);
+  assert.equal(queueImage.queueVersion, manualQueueVersion);
+  const imageEdit = {
+    editType: "image",
+    id: "image-edit-smoke",
+    kind: "imageResize",
+    page: locateImage.page,
+    rects: [{ page: locateImage.page, x: locateImage.bounds.x / locateImage.pageWidth, y: locateImage.bounds.y / locateImage.pageHeight, width: locateImage.bounds.width / locateImage.pageWidth, height: locateImage.bounds.height / locateImage.pageHeight }],
+    imagePath: "figures/Fig01.png",
+    originalValue: "width=0.58\\textwidth",
+    candidateValue: "width=0.609\\textwidth",
+    factor: 1.05
+  };
+  directEdits.push(imageEdit);
+  manualQueueVersion += 1;
+  await page.evaluate(({ requestId, edit, edits, queueVersion }) => window.dispatchEvent(new MessageEvent("message", { data: {
+    type: "imageEditQueued",
+    requestId,
+    edit,
+    edits,
+    count: edits.length,
+    queueVersion,
+    canUndo: true,
+    canRedo: false,
+    manualEditMode: "direct"
+  } })), { requestId: queueImage.requestId, edit: imageEdit, edits: directEdits, queueVersion: manualQueueVersion });
+  assert.equal(await page.locator(".image-edit-controls").count(), 0);
+  assert.ok((await page.locator(".manual-edit-image").count()) >= 1);
+  assert.equal(await page.locator("#compile").textContent(), `应用 ${directEdits.length} 项并编译`);
+  await page.locator("#direct-edit").click();
+  await page.locator("#page-number").fill("2");
+  await page.locator("#page-number").press("Enter");
+  await page.waitForFunction(() => document.querySelector('.pdf-page[data-page-number="2"][data-render-stage="text"]'));
+
   const acknowledgeDirectEdit = async (queued, id) => {
     const edit = {
       id,
       kind: queued.kind,
-      page: queued.rects.length > 0 ? Number((await page.locator(".direct-edit-draft-overlay").getAttribute("data-page-number")) || 1) : 1,
+      page: queued.rects.length > 0 ? Number((await page.locator(".direct-edit-draft-overlay").first().getAttribute("data-page-number")) || 1) : 1,
       rects: queued.rects,
       insertedText: queued.text
     };
@@ -951,6 +1204,58 @@ try {
   assert.equal("caretVisibleOffset" in directDelete, false);
   await acknowledgeDirectEdit(directDelete, "direct_delete");
 
+  const crossPageDirect = await selectAcrossRenderedPages(page);
+  assert.equal(crossPageDirect.selection.pageFragments.length, 2);
+  assert.equal(await page.locator(".direct-edit-draft-overlay").count(), 2);
+  await mapSmokeSelection(page, crossPageDirect.selection, "cross_page_replace");
+  await page.locator("#direct-edit-input").fill("跨页整体替换");
+  await page.locator("#direct-edit-input").press("Control+Enter");
+  const directCrossPageReplace = await page.evaluate(() => window.__messages.findLast((message) => message.type === "queueManualEdit"));
+  assert.equal(directCrossPageReplace.kind, "replace");
+  assert.equal(directCrossPageReplace.text, "跨页整体替换");
+  assert.deepEqual([...new Set(directCrossPageReplace.rects.map((rect) => rect.page))], crossPageDirect.pages);
+  await acknowledgeDirectEdit(directCrossPageReplace, "direct_cross_page_replace");
+  assert.ok((await page.locator(".manual-edit-overlay").count()) >= 2);
+
+  await page.locator("#region-select").click();
+  assert.equal(await page.locator("#mode-direct").getAttribute("aria-pressed"), "true");
+  assert.equal(await page.locator("#region-select").getAttribute("aria-pressed"), "true");
+  const regionReplaceCount = await page.evaluate(() => window.__messages.filter((message) => message.type === "selection").length);
+  await dragRegion(page, await findVisibleTextBox(page));
+  await page.waitForFunction((count) => window.__messages.filter((message) => message.type === "selection").length > count, regionReplaceCount);
+  const directRegionReplaceSelection = await page.evaluate(() => window.__messages.findLast((message) => message.type === "selection"));
+  assert.equal(directRegionReplaceSelection.selectionKind, "region");
+  assert.equal(directRegionReplaceSelection.interactionMode, "direct");
+  assert.ok(directRegionReplaceSelection.fragments.length >= 1);
+  await mapSmokeSelection(page, directRegionReplaceSelection, "region_replace");
+  await page.locator("#direct-edit-input").fill("区域整体替换");
+  await page.locator("#mode-agent").click();
+  assert.equal(await page.locator("#mode-direct").getAttribute("aria-pressed"), "true", "非空草稿不能被模式切换丢弃。");
+  await page.locator("#direct-edit-input").press("Control+Enter");
+  const directRegionReplace = await page.evaluate(() => window.__messages.findLast((message) => message.type === "queueManualEdit"));
+  assert.equal(directRegionReplace.kind, "replace");
+  assert.equal(directRegionReplace.text, "区域整体替换");
+  assert.equal("caretVisibleOffset" in directRegionReplace, false);
+  await acknowledgeDirectEdit(directRegionReplace, "direct_region_replace");
+
+  const regionDeleteCount = await page.evaluate(() => window.__messages.filter((message) => message.type === "selection").length);
+  await dragRegion(page, await findVisibleTextBox(page));
+  await page.waitForFunction((count) => window.__messages.filter((message) => message.type === "selection").length > count, regionDeleteCount);
+  const directRegionDeleteSelection = await page.evaluate(() => window.__messages.findLast((message) => message.type === "selection"));
+  await mapSmokeSelection(page, directRegionDeleteSelection, "region_delete");
+  await page.locator("#direct-edit-input").press("Delete");
+  assert.equal(await page.locator(".direct-edit-draft-overlay").getAttribute("data-kind"), "delete");
+  await page.locator("#direct-edit-input").press("Control+Enter");
+  const directRegionDelete = await page.evaluate(() => window.__messages.findLast((message) => message.type === "queueManualEdit"));
+  assert.equal(directRegionDelete.kind, "delete");
+  assert.equal(directRegionDelete.text, "");
+  assert.equal("caretDeleteDirection" in directRegionDelete, false);
+  await acknowledgeDirectEdit(directRegionDelete, "direct_region_delete");
+
+  await page.locator("#direct-edit").click();
+  assert.equal(await page.locator("#mode-direct").getAttribute("aria-pressed"), "true");
+  assert.equal(await page.locator("#direct-edit").getAttribute("aria-pressed"), "true");
+
   const insertionSelection = await clickVisibleTextForDirectEdit(page);
   assert.ok(insertionSelection.text.length >= 4);
   await mapSmokeSelection(page, insertionSelection, "insert");
@@ -959,10 +1264,10 @@ try {
     undo: window.__messages.filter((message) => message.type === "undoManualEdit").length,
     redo: window.__messages.filter((message) => message.type === "redoManualEdit").length
   }));
-  await page.locator("#instruction").fill("提示词输入不应操作编辑队列");
-  await page.locator("#instruction").press("Control+z");
-  await page.locator("#instruction").press("Control+y");
-  await page.locator("#instruction").press("Control+Shift+z");
+  await page.locator("#direct-edit-input").fill("输入框编辑不应操作编辑队列");
+  await page.locator("#direct-edit-input").press("Control+z");
+  await page.locator("#direct-edit-input").press("Control+y");
+  await page.locator("#direct-edit-input").press("Control+Shift+z");
   assert.deepEqual(await page.evaluate(() => ({
     undo: window.__messages.filter((message) => message.type === "undoManualEdit").length,
     redo: window.__messages.filter((message) => message.type === "redoManualEdit").length
@@ -979,6 +1284,8 @@ try {
   assert.equal(directInsert.text, "光标插入");
   assert.ok(Number.isInteger(directInsert.caretVisibleOffset));
   assert.ok(directInsert.caretVisibleOffset >= 0 && directInsert.caretVisibleOffset <= anchorVisibleLength);
+  assert.ok(Number.isFinite(insertionSelection.caretPoint?.x) && Number.isFinite(insertionSelection.caretPoint?.y));
+  assert.ok(insertionSelection.caretPoint.x >= 0 && insertionSelection.caretPoint.y >= 0);
   assert.equal("caretDeleteDirection" in directInsert, false);
   await acknowledgeDirectEdit(directInsert, "direct_insert");
 
@@ -1082,6 +1389,7 @@ try {
     return { left: rect.left, right: rect.right, viewportWidth: innerWidth };
   });
   assert.ok(narrowProgress.left >= 0 && narrowProgress.right <= narrowProgress.viewportWidth);
+  await page.locator("#mode-agent").click();
   const narrowAnalysisLayout = await page.locator(".analysis-row").evaluate((row) => {
     const input = row.querySelector("#instruction").getBoundingClientRect();
     const button = row.querySelector("#analyze").getBoundingClientRect();
@@ -1113,6 +1421,14 @@ try {
     const rect = button.getBoundingClientRect();
     return rect.left >= toolbar.left - 1 && rect.right <= toolbar.right + 1;
   }), true);
+  const narrowModeSwitch = await page.locator("#interaction-mode").evaluate((element) => {
+    const toolbar = element.closest(".toolbar").getBoundingClientRect();
+    element.scrollIntoView({ inline: "nearest", block: "nearest" });
+    const rect = element.getBoundingClientRect();
+    return { left: rect.left, right: rect.right, toolbarLeft: toolbar.left, toolbarRight: toolbar.right };
+  });
+  assert.ok(narrowModeSwitch.left >= narrowModeSwitch.toolbarLeft - 1 && narrowModeSwitch.right <= narrowModeSwitch.toolbarRight + 1);
+  await page.locator("#mode-direct").click();
   await clickVisibleTextForDirectEdit(page);
   await page.locator("#direct-edit-input").fill("窄屏直接编辑输入框边界检查");
   const narrowDraftRect = await page.locator("#direct-edit-input").evaluate((input) => {

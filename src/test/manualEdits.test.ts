@@ -172,8 +172,7 @@ describe("PDF 文字到普通正文的字符级定位", () => {
       ["前文 {目标} 后文", "{目标}"],
       ["前文 $目标$ 后文", "$目标$"],
       ["前文 % 目标注释", "目标注释"],
-      ["前文 甲 & 乙 后文", "甲&乙"],
-      ["前文 \\textbf{目标} 后文", "目标"]
+      ["前文 甲 & 乙 后文", "甲&乙"]
     ];
     for (const [source, selected] of invalidCases) {
       assert.throws(() => resolveManualEditSourceRange(mapping(source, selected)), /LaTeX|匹配/);
@@ -259,6 +258,18 @@ describe("PDF 文字到普通正文的字符级定位", () => {
 });
 
 describe("新增文字与队列校验", () => {
+  it("保留跨页预览矩形的所属页码", () => {
+    const edit = createPendingManualEdit(
+      mapping("前文目标后文", "目标"),
+      "replace",
+      "替换",
+      [
+        { page: 2, x: 0.1, y: 0.8, width: 0.3, height: 0.04 },
+        { page: 3, x: 0.1, y: 0.1, width: 0.3, height: 0.04 }
+      ]
+    );
+    assert.deepEqual(edit.rects.map((rect) => rect.page), [2, 3]);
+  });
   it("将所有 LaTeX 特殊字符作为纯文本转义", () => {
     assert.equal(
       escapeLatexPlainText("50%_a & {b} #1 $x$ \\ ^ ~"),
@@ -343,19 +354,17 @@ describe("新增文字与队列校验", () => {
     }
   });
 
-  it("自适应锚点仍拒绝命令边界、重复位置和命令参数内部", () => {
+  it("结构感知锚点支持引用后插入，并仍拒绝重复位置和公式内部", () => {
     const commandSource = "甲乙丙丁\\cite{ref21}戊己庚辛壬癸";
     const commandVisible = "甲乙丙丁[21]戊己庚辛壬癸";
-    assert.throws(
-      () => createPendingCaretManualEdit(
-        mapping(commandSource, commandVisible),
-        "insertAfter",
-        "新增",
-        normalizeManualEditVisibleGraphemes("甲乙丙丁[21]").length,
-        rects
-      ),
-      /无法唯一映射|普通文字不足/
+    const afterCitation = createPendingCaretManualEdit(
+      mapping(commandSource, commandVisible),
+      "insertAfter",
+      "新增",
+      normalizeManualEditVisibleGraphemes("甲乙丙丁[21]").length,
+      rects
     );
+    assert.equal(afterCitation.startOffset, 100 + commandSource.indexOf("戊"));
 
     const repeatedSource = "前导\\cite{a}甲乙丙丁戊己庚辛壬癸。另处甲乙丙丁戊己庚辛壬癸";
     const repeatedVisible = "前导[1]甲乙丙丁戊己庚辛壬癸";
@@ -370,35 +379,64 @@ describe("新增文字与队列校验", () => {
       /多个候选边界/
     );
 
-    const formattedSource = "前导\\textbf{甲乙丙丁戊己庚辛壬癸}后文";
-    const formattedVisible = "前导甲乙丙丁戊己庚辛壬癸后文";
+    const formulaSource = "结果为$K_I$，随后甲乙丙丁戊己";
+    const formulaVisible = "结果为KI，随后甲乙丙丁戊己";
     assert.throws(
       () => createPendingCaretManualEdit(
-        mapping(formattedSource, formattedVisible),
+        mapping(formulaSource, formulaVisible),
         "insertBefore",
         "新增",
-        normalizeManualEditVisibleGraphemes("前导甲乙丙丁戊己").length,
+        normalizeManualEditVisibleGraphemes("结果为K").length,
         rects
       ),
-      /LaTeX 命令|注释|数学环境/
+      /公式、引用|安全的普通正文/
     );
   });
 
-  it("光标删除不使用自适应插入锚点", () => {
+  it("允许替换格式命令参数中的普通正文", () => {
+    const source = "前文\\textbf{目标正文}后文";
+    const item = createPendingManualEdit(mapping(source, "目标正文"), "replace", "替换正文", rects);
+    assert.equal(item.sourceText, "目标正文");
+    assert.equal(item.startOffset, 100 + source.indexOf("目标正文"));
+  });
+
+  it("结构感知光标删除只删除引用后的普通文字", () => {
     const source = "引文\\cite{ref21}之后甲乙丙丁戊己这里庚辛壬癸结束";
     const visible = "引文[21]之后甲乙丙丁戊己这里庚辛壬癸结束";
-    assert.throws(
-      () => createPendingCaretManualEdit(
-        mapping(source, visible),
-        "delete",
-        "",
-        normalizeManualEditVisibleGraphemes("引文[21]之后甲乙丙丁戊己").length,
-        rects,
-        "strict-delete",
-        "backward"
-      ),
-      /字符级匹配/
+    const deletion = createPendingCaretManualEdit(
+      mapping(source, visible),
+      "delete",
+      "",
+      normalizeManualEditVisibleGraphemes("引文[21]之后甲乙丙丁戊己").length,
+      rects,
+      "structured-delete",
+      "backward"
     );
+    assert.equal(deletion.sourceText, "己");
+    assert.equal(deletion.startOffset, 100 + source.indexOf("己"));
+  });
+
+  it("允许在行内公式前后及格式命令正文中插入", () => {
+    const formulaSource = "结果为$K_I$，随后甲乙丙丁戊己";
+    const formulaVisible = "结果为KI，随后甲乙丙丁戊己";
+    const before = createPendingCaretManualEdit(
+      mapping(formulaSource, formulaVisible), "insertBefore", "新增",
+      normalizeManualEditVisibleGraphemes("结果为").length, rects
+    );
+    const after = createPendingCaretManualEdit(
+      mapping(formulaSource, formulaVisible), "insertAfter", "新增",
+      normalizeManualEditVisibleGraphemes("结果为KI").length, rects
+    );
+    assert.equal(before.startOffset, 100 + formulaSource.indexOf("$K_I$"));
+    assert.equal(after.startOffset, 100 + formulaSource.indexOf("，"));
+
+    const formattedSource = "前导\\textbf{甲乙丙丁戊己庚辛壬癸}后文";
+    const formattedVisible = "前导甲乙丙丁戊己庚辛壬癸后文";
+    const formatted = createPendingCaretManualEdit(
+      mapping(formattedSource, formattedVisible), "insertBefore", "新增",
+      normalizeManualEditVisibleGraphemes("前导甲乙丙丁戊己").length, rects
+    );
+    assert.equal(formatted.startOffset, 100 + formattedSource.indexOf("庚"));
   });
 
   it("光标删除一次移除完整组合字素或 ZWJ 字素", () => {

@@ -33,6 +33,18 @@ describe("外部进程控制", () => {
     assert.equal(result.code, 2);
   });
 
+  it("收到取消信号后终止进程并正常结算", async () => {
+    const controller = new AbortController();
+    const task = runProcess(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+      cwd: process.cwd(),
+      timeoutMs: 30_000,
+      signal: controller.signal
+    });
+    controller.abort();
+    const result = await task;
+    assert.equal(result.timedOut, false);
+  });
+
   it("缓存成功的可执行路径并可显式失效", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "circletex-command-cache-"));
     const executable = path.join(root, "tool.exe");
