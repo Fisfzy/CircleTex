@@ -4,8 +4,15 @@ node_modules/
 # Build output
 out/
 
-# VSIX packages
-*.vsix
+# Old VSIX packages (keep only latest)
+circletex-0.2.*.vsix
+circletex-0.3.*.vsix
+circletex-0.4.*.vsix
+circletex-0.5.*.vsix
+circletex-0.6.*.vsix
+circletex-0.7.0.vsix
+circletex-0.7.1.vsix
+circletex-0.7.2.vsix
 
 # Internal artifacts
 artifacts/
