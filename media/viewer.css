@@ -2,6 +2,7 @@
   color-scheme: light dark;
   font-family: var(--vscode-font-family);
   font-size: var(--vscode-font-size);
+  --circletex-dock-height: 38vh;
 }
 
 * { box-sizing: border-box; }
@@ -148,8 +149,9 @@ button:disabled { opacity: 0.45; cursor: default; }
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr) 7px minmax(168px, var(--circletex-dock-height));
 }
+.dock-collapsed .layout { grid-template-rows: minmax(0, 1fr) 28px 0; }
 
 .viewer {
   position: relative;
@@ -210,6 +212,92 @@ button:disabled { opacity: 0.45; cursor: default; }
   display: block;
   object-fit: fill;
 }
+
+.dock-resizer {
+  position: relative;
+  z-index: 12;
+  background: var(--vscode-panel-border, transparent);
+}
+.dock-resize-handle {
+  position: absolute;
+  inset: 0;
+  cursor: row-resize;
+  touch-action: none;
+}
+.dock-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  right: 0;
+  left: 0;
+  height: 2px;
+  background: transparent;
+}
+.dock-resize-handle:hover::after,
+.dock-resize-handle:focus-visible::after,
+body.is-resizing-dock .dock-resize-handle::after { background: var(--vscode-focusBorder, #007acc); }
+.dock-toggle {
+  position: absolute;
+  z-index: 2;
+  top: -9px;
+  right: 12px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 3px;
+  color: var(--vscode-descriptionForeground);
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  border-color: var(--vscode-panel-border, transparent);
+  line-height: 1;
+}
+.dock-toggle:hover { color: var(--vscode-button-foreground); }
+.dock-collapsed-progress { display: none; }
+.dock-collapsed .dock-collapsed-progress {
+  position: absolute;
+  inset: 0 48px 0 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 86px;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+  line-height: 1;
+}
+#dock-collapsed-progress-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#dock-collapsed-progress-value { font-variant-numeric: tabular-nums; }
+.dock-collapsed-progress-track {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--vscode-progressBar-background, #0e70c0) 22%, transparent);
+}
+.dock-collapsed-progress-fill {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--vscode-progressBar-background, #0e70c0);
+  transition: width 180ms ease;
+}
+.dock-collapsed-progress[data-kind="success"] { color: var(--vscode-testing-iconPassed, #2ea043); }
+.dock-collapsed-progress[data-kind="success"] .dock-collapsed-progress-fill { background: var(--vscode-testing-iconPassed, #2ea043); }
+.dock-collapsed-progress[data-kind="warning"] { color: var(--vscode-editorWarning-foreground); }
+.dock-collapsed-progress[data-kind="error"] { color: var(--vscode-errorForeground); }
+.dock-collapsed-progress[data-kind="error"] .dock-collapsed-progress-fill { background: var(--vscode-errorForeground); }
+.dock-collapsed-progress[data-has-progress="false"] {
+  grid-template-columns: minmax(0, 1fr);
+}
+.dock-collapsed-progress[data-has-progress="false"] #dock-collapsed-progress-value,
+.dock-collapsed-progress[data-has-progress="false"] .dock-collapsed-progress-track { display: none; }
+.dock-collapsed .dock-resize-handle { display: none; }
+.dock-collapsed .dock-toggle { top: 2px; }
+.dock-collapsed .revision-dock { display: none; }
+body.is-resizing-dock { cursor: row-resize; user-select: none; }
 
 .startup-preview-overlay {
   position: absolute;
@@ -510,7 +598,8 @@ button:disabled { opacity: 0.45; cursor: default; }
 
 .revision-dock {
   min-width: 0;
-  max-height: 44vh;
+  min-height: 0;
+  height: 100%;
   overflow: auto;
   border-top: 1px solid var(--vscode-panel-border);
   background: var(--vscode-editor-background);
@@ -981,13 +1070,14 @@ pre {
 #status[data-kind="error"] { color: var(--vscode-errorForeground); }
 #status[data-kind="warning"] { color: var(--vscode-editorWarning-foreground); }
 #status[data-kind="busy"] { color: var(--vscode-progressBar-background); }
+#status[data-kind="success"] { color: var(--vscode-testing-iconPassed, #2ea043); }
 
 [hidden] { display: none !important; }
 
 @media (max-width: 680px) {
   .toolbar #fit-width { display: none; }
   .candidate-actions { justify-content: start; max-width: none; }
-  .revision-dock { max-height: 52vh; }
+  .layout { grid-template-rows: minmax(0, 1fr) 7px minmax(168px, var(--circletex-dock-height)); }
   #manual-edit-bar,
   .manual-edit-bar { grid-template-columns: 1fr; }
   #pending-edit-count { text-align: left; }

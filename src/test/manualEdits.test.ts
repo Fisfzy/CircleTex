@@ -439,6 +439,32 @@ describe("新增文字与队列校验", () => {
     assert.equal(formatted.startOffset, 100 + formattedSource.indexOf("庚"));
   });
 
+  it("允许直接删除完整公式及其相邻正文，但拒绝公式内部片段", () => {
+    const source = "前文结果为$K_I$，后文";
+    const complete = createPendingManualEdit(
+      mapping(source, "结果为KI，"), "delete", "", rects, "delete-complete-formula"
+    );
+    assert.equal(complete.structuralFormula, true);
+    assert.equal(complete.sourceText, "结果为$K_I$，");
+    const base = `${"甲".repeat(100)}${source}`;
+    assert.equal(applyDirectManualEdits(base, [complete]), `${"甲".repeat(100)}前文后文`);
+    assert.throws(() => applyManualEdits(base, [complete]), /只支持直接编辑/u);
+
+    assert.throws(
+      () => createPendingManualEdit(mapping(source, "K"), "delete", "", rects),
+      /未完整覆盖|完整公式/u
+    );
+  });
+
+  it("识别常见希腊字母、下标与关系符号的完整公式删除", () => {
+    const source = "当$\\sigma_{xx}\\leq 1$时材料保持稳定。";
+    const complete = createPendingManualEdit(
+      mapping(source, "当σxx≤1时"), "delete", "", rects, "delete-symbol-formula"
+    );
+    assert.equal(complete.structuralFormula, true);
+    assert.equal(complete.sourceText, "当$\\sigma_{xx}\\leq 1$时");
+  });
+
   it("光标删除一次移除完整组合字素或 ZWJ 字素", () => {
     const decomposedAccent = "e\u0301";
     const accent = createPendingCaretManualEdit(

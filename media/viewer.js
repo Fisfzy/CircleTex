@@ -8,6 +8,13 @@ const persisted = vscode.getState() ?? {};
 const elements = {
   viewer: document.getElementById("viewer"),
   pages: document.getElementById("pages"),
+  dockResizer: document.getElementById("dock-resize-handle"),
+  dockToggle: document.getElementById("dock-toggle"),
+  dockCollapsedProgress: document.getElementById("dock-collapsed-progress"),
+  dockCollapsedProgressLabel: document.getElementById("dock-collapsed-progress-label"),
+  dockCollapsedProgressValue: document.getElementById("dock-collapsed-progress-value"),
+  dockCollapsedProgressTrack: document.getElementById("dock-collapsed-progress-track"),
+  dockCollapsedProgressFill: document.getElementById("dock-collapsed-progress-fill"),
   loading: document.getElementById("loading"),
   loadingLabel: document.getElementById("loading-label"),
   loadingValue: document.getElementById("loading-value"),
@@ -143,9 +150,25 @@ showManualEditsDiffButton.id = "show-manual-edits-diff";
 showManualEditsDiffButton.className = "secondary-button";
 showManualEditsDiffButton.type = "button";
 showManualEditsDiffButton.textContent = "查看改动";
+showManualEditsDiffButton.title = "查看待编译编辑的源码差异";
+showManualEditsDiffButton.setAttribute("aria-label", "查看待编译编辑的源码差异");
 showManualEditsDiffButton.disabled = true;
 elements.manualClear.after(showManualEditsDiffButton);
 elements.showManualEditsDiff = showManualEditsDiffButton;
+
+for (const [button, hint, shortcut] of [
+  [elements.regionSelect, "区域框选：选择连续正文或图片", ""],
+  [elements.directEdit, "文字或光标选择：建立直接编辑草稿", ""],
+  [elements.clearSelection, "清除当前 PDF 选区", "Escape"],
+  [elements.manualUndo, "撤销上一项待编译编辑", "Ctrl+Z"],
+  [elements.manualClear, "放弃全部待编译编辑", ""],
+  [elements.showManualEditsDiff, "查看待编译编辑的源码差异", ""]
+]) {
+  if (!button) continue;
+  button.title = shortcut ? `${hint}（${shortcut}）` : hint;
+  button.setAttribute("aria-label", shortcut ? `${hint}，快捷键 ${shortcut}` : hint);
+  if (shortcut) button.setAttribute("aria-keyshortcuts", shortcut === "Ctrl+Z" ? "Control+Z Meta+Z" : shortcut);
+}
 
 const initialPageNumber = positivePage(persisted.pageNumber) || positivePage(config.preview?.page) || 1;
 const state = {
@@ -210,6 +233,9 @@ const state = {
   skillProgressEvents: [],
   scrollFrame: 0,
   imageControlFrame: 0,
+  dockHeight: 0,
+  dockCollapsed: false,
+  dockResize: undefined,
   saveTimer: undefined,
   resizeTimer: undefined,
   wheelTimer: undefined,
@@ -220,12 +246,82 @@ const state = {
   compileProgressActive: false,
   compileProgressPercent: 0,
   compileProgressHideTimer: undefined,
+  statusMessage: "请在 PDF 中划选需要修改的文字。",
+  statusKind: "ready",
   cachedPreviewSignature: undefined,
   startupPreview: undefined,
   cachedPreviewPage: undefined,
   previewCacheTimer: undefined,
   primaryRenderPending: false
 };
+
+function boundedDockHeight(value) {
+  const minimum = 168;
+  const maximum = Math.max(minimum, window.innerHeight - 170);
+  const fallback = Math.round(window.innerHeight * 0.38);
+  return clamp(Number(value) || fallback, minimum, maximum);
+}
+
+function applyDockHeight(value) {
+  state.dockHeight = boundedDockHeight(value);
+  document.documentElement.style.setProperty("--circletex-dock-height", `${state.dockHeight}px`);
+  elements.dockResizer?.setAttribute("aria-valuemin", "168");
+  elements.dockResizer?.setAttribute("aria-valuemax", String(Math.max(168, window.innerHeight - 170)));
+  elements.dockResizer?.setAttribute("aria-valuenow", String(Math.round(state.dockHeight)));
+}
+
+function applyDockCollapsed(value) {
+  state.dockCollapsed = Boolean(value);
+  document.documentElement.classList.toggle("dock-collapsed", state.dockCollapsed);
+  if (elements.dockToggle) {
+    elements.dockToggle.textContent = state.dockCollapsed ? "⌃" : "⌄";
+    const label = state.dockCollapsed ? "展开审阅工具区" : "收起审阅工具区";
+    elements.dockToggle.title = `${label}${state.dockCollapsed ? "，恢复编辑与确认模块" : "，扩大 PDF 阅读视窗"}`;
+    elements.dockToggle.setAttribute("aria-label", label);
+    elements.dockToggle.setAttribute("aria-expanded", String(!state.dockCollapsed));
+  }
+  updateCollapsedDockProgress();
+}
+
+function toggleDockCollapsed() {
+  applyDockCollapsed(!state.dockCollapsed);
+  updateVisiblePages();
+  positionImageEditControls();
+  scheduleStateSave();
+}
+
+function beginDockResize(event) {
+  if (state.dockCollapsed || event.button !== 0 || !elements.dockResizer) return;
+  event.preventDefault();
+  state.dockResize = { pointerId: event.pointerId, startY: event.clientY, startHeight: state.dockHeight, frame: 0 };
+  elements.dockResizer.setPointerCapture(event.pointerId);
+  document.body.classList.add("is-resizing-dock");
+}
+
+function moveDockResize(event) {
+  const resize = state.dockResize;
+  if (!resize || event.pointerId !== resize.pointerId) return;
+  const height = boundedDockHeight(resize.startHeight + resize.startY - event.clientY);
+  if (resize.frame) cancelAnimationFrame(resize.frame);
+  resize.frame = requestAnimationFrame(() => {
+    resize.frame = 0;
+    applyDockHeight(height);
+    updateVisiblePages();
+    positionImageEditControls();
+  });
+}
+
+function endDockResize(event) {
+  const resize = state.dockResize;
+  if (!resize || event.pointerId !== resize.pointerId) return;
+  if (resize.frame) cancelAnimationFrame(resize.frame);
+  state.dockResize = undefined;
+  document.body.classList.remove("is-resizing-dock");
+  scheduleStateSave();
+}
+
+applyDockHeight(persisted.dockHeight);
+applyDockCollapsed(persisted.dockCollapsed === true);
 
 function showImmediateStartupPreview() {
   const preview = config.preview;
@@ -988,7 +1084,9 @@ function captureViewState() {
     fitMode: state.fitMode,
     selectionTool: state.selectionTool,
     interactionMode: state.interactionMode,
-    directEditEnabled: state.interactionMode === "direct"
+    directEditEnabled: state.interactionMode === "direct",
+    dockHeight: state.dockHeight,
+    dockCollapsed: state.dockCollapsed
   };
 }
 
@@ -1509,6 +1607,18 @@ function queueImageEditDraft() {
   });
 }
 
+function requestCompile() {
+  if (isWriteInteractionBusy()) return;
+  if (state.imageEditDraft || state.directDraft) {
+    setStatus("请先使用 Ctrl+Enter 暂存当前编辑，或按 Esc 取消。", "warning");
+    return;
+  }
+  state.busyAction = "compile";
+  elements.compile.disabled = true;
+  updateManualEditAvailability();
+  post("compile", { queueVersion: state.manualEditQueueVersion });
+}
+
 function cancelImageEditDraft() {
   if (!state.imageEditDraft && !state.imageLocateRequestId) return false;
   clearImageEditDraft();
@@ -1561,13 +1671,13 @@ function renderImageEditDraft() {
   const enlarge = document.createElement("button");
   enlarge.type = "button";
   enlarge.textContent = "↑";
-  enlarge.title = "放大 5%";
+  enlarge.title = "图片放大 5%";
   enlarge.setAttribute("aria-label", "图片放大 5%");
   enlarge.addEventListener("click", () => adjustImageEditDraft(1));
   const shrink = document.createElement("button");
   shrink.type = "button";
   shrink.textContent = "↓";
-  shrink.title = "缩小 5%";
+  shrink.title = "图片缩小 5%";
   shrink.setAttribute("aria-label", "图片缩小 5%");
   shrink.addEventListener("click", () => adjustImageEditDraft(-1));
   const value = document.createElement("span");
@@ -1577,6 +1687,9 @@ function renderImageEditDraft() {
   const confirm = document.createElement("button");
   confirm.type = "button";
   confirm.textContent = "确认";
+  confirm.title = "暂存图片尺寸调整（Ctrl+Enter）";
+  confirm.setAttribute("aria-label", "暂存图片尺寸调整，快捷键 Ctrl+Enter");
+  confirm.setAttribute("aria-keyshortcuts", "Control+Enter Meta+Enter");
   confirm.disabled = Math.abs(draft.factor - 1) < 0.0001;
   confirm.addEventListener("click", queueImageEditDraft);
   const cancel = document.createElement("button");
@@ -3024,6 +3137,7 @@ function updateManualEditAvailability() {
   const baseDisabled = Boolean(reason);
   const historyBusy = state.analyzing || isWriteInteractionBusy();
   const pendingCount = state.pendingManualEditCount;
+  updateCollapsedDockProgress();
 
   elements.manualText.disabled = baseDisabled;
   const regionEdit = state.selectionLabel === "区域框选";
@@ -3042,7 +3156,10 @@ function updateManualEditAvailability() {
     elements.manualReplace,
     elements.manualDelete
   ]) {
-    button.title = reason;
+    const action = button === elements.manualInsertBefore ? "在选区前插入文字" :
+      button === elements.manualInsertAfter ? "在选区后插入文字" :
+        button === elements.manualReplace ? "替换选区文字" : "删除选区文字";
+    button.title = reason || action;
   }
   elements.manualUndo.disabled = !state.canUndoManualEdit || historyBusy;
   elements.manualClear.disabled = (pendingCount === 0 && !state.canRedoManualEdit) || historyBusy;
@@ -3058,6 +3175,10 @@ function updateManualEditAvailability() {
     ? `有 ${pendingCount} 项编辑将在下次编译时写入 main.tex。`
     : "当前没有待编译编辑。";
   elements.compile.textContent = pendingCount > 0 ? `应用 ${pendingCount} 项并编译` : "编译";
+  const compileHint = pendingCount > 0 ? `应用 ${pendingCount} 项待编译编辑并编译论文` : "编译当前论文";
+  elements.compile.title = `${compileHint}（Ctrl+Enter）`;
+  elements.compile.setAttribute("aria-label", `${compileHint}，快捷键 Ctrl+Enter`);
+  elements.compile.setAttribute("aria-keyshortcuts", "Control+Enter Meta+Enter");
   renderPendingManualEditList();
 
   const pendingBlocksAi = pendingCount > 0;
@@ -3106,6 +3227,7 @@ function normalizePendingEdit(raw) {
     page,
     rects,
     insertedText: typeof raw.insertedText === "string" ? raw.insertedText : "",
+    structuralFormula: raw.structuralFormula === true,
     ...(imageEdit ? {
       imagePath: typeof raw.imagePath === "string" ? raw.imagePath : "",
       originalValue: typeof raw.originalValue === "string" ? raw.originalValue : "原尺寸",
@@ -3179,6 +3301,7 @@ function pendingEditLabel(edit) {
     const delta = Math.round((edit.factor - 1) * 100);
     return `${page} 图片${delta >= 0 ? "放大" : "缩小"} ${Math.abs(delta)}%`;
   }
+  if (edit.structuralFormula) return `${page} 删除完整公式结构`;
   const labels = { insertBefore: "前插", insertAfter: "后插", replace: "替换", delete: "删除" };
   const text = typeof edit.insertedText === "string" ? edit.insertedText.replace(/\s+/gu, " ").trim() : "";
   return text ? `${page} ${labels[edit.kind] ?? "编辑"}：${text.slice(0, 48)}` : `${page} ${labels[edit.kind] ?? "编辑"}`;
@@ -3463,6 +3586,7 @@ function updateSkillProgress(message) {
   appendSkillProgressEvent(progressMessage, detail);
   updateSkillElapsed();
   renderSkillStages();
+  updateCollapsedDockProgress();
 }
 
 function normalizedSkillStage(value) {
@@ -3615,6 +3739,7 @@ function finishSkillProgress(message, kind, qualityGates) {
   showSkillQualityGates(qualityGates);
   updateSkillElapsed();
   renderSkillStages();
+  updateCollapsedDockProgress();
 }
 
 function showSkillQualityGates(gates) {
@@ -3696,6 +3821,47 @@ function showSkillArtifacts(message) {
 function setStatus(message, kind = "ready") {
   elements.status.textContent = message;
   elements.status.dataset.kind = kind;
+  state.statusMessage = typeof message === "string" ? message : "";
+  state.statusKind = kind;
+  updateCollapsedDockProgress();
+}
+
+function updateCollapsedDockProgress() {
+  if (!elements.dockCollapsedProgress) return;
+  let label = "";
+  let percent = 0;
+  let kind = "ready";
+  let hasProgress = false;
+
+  if (state.compileProgressActive || !elements.compileProgress.hidden) {
+    percent = state.compileProgressPercent;
+    const phase = elements.compileProgressLabel.textContent?.trim() || "正在编译";
+    const progressKind = elements.compileProgress.dataset.kind;
+    label = `编译 · ${phase}`;
+    kind = progressKind === "error" ? "error" : progressKind === "success" ? "success" : "busy";
+    hasProgress = true;
+  } else if (!elements.skillProgress.hidden) {
+    percent = state.skillProgressPercent;
+    const name = elements.skillProgressName.textContent?.trim() || "Skill 任务";
+    const phase = elements.skillProgressMessage.textContent?.trim() || "正在执行";
+    const progressState = elements.skillProgress.dataset.state;
+    label = `${name} · ${phase}`;
+    kind = progressState === "failed" ? "error" : progressState === "completed" ? "success" : "busy";
+    hasProgress = true;
+  } else if (state.pendingManualEditCount > 0) {
+    label = `工具区已收起 · ${state.pendingManualEditCount} 项待编译`;
+    kind = "warning";
+  } else {
+    label = state.statusMessage || "工具区已收起";
+    kind = state.statusKind || "ready";
+  }
+
+  elements.dockCollapsedProgress.dataset.kind = kind;
+  elements.dockCollapsedProgress.dataset.hasProgress = String(hasProgress);
+  elements.dockCollapsedProgressLabel.textContent = label;
+  elements.dockCollapsedProgressValue.textContent = hasProgress ? `${Math.round(percent)}%` : "";
+  elements.dockCollapsedProgressFill.style.width = `${percent}%`;
+  elements.dockCollapsedProgressTrack.setAttribute("aria-valuenow", String(Math.round(percent)));
 }
 
 function updateCompileProgress(message) {
@@ -3710,15 +3876,18 @@ function updateCompileProgress(message) {
   elements.compileProgressValue.textContent = `${Math.round(percent)}%`;
   elements.compileProgressFill.style.width = `${percent}%`;
   elements.compileProgressTrack.setAttribute("aria-valuenow", String(Math.round(percent)));
+  updateCollapsedDockProgress();
 }
 
 function finishCompileProgress(message, kind = "success") {
   updateCompileProgress({ percent: kind === "success" ? 100 : state.compileProgressPercent, message, indeterminate: false });
   elements.compileProgress.dataset.kind = kind;
   state.compileProgressActive = false;
+  updateCollapsedDockProgress();
   if (kind === "success") {
     state.compileProgressHideTimer = setTimeout(() => {
       elements.compileProgress.hidden = true;
+      updateCollapsedDockProgress();
     }, 2_500);
   }
 }
@@ -3865,6 +4034,23 @@ function scheduleSelectionCaptureFromEvent(event) {
 elements.pages.addEventListener("mouseup", scheduleSelectionCaptureFromEvent);
 elements.pages.addEventListener("keyup", scheduleSelectionCaptureFromEvent);
 elements.pages.addEventListener("click", handleDirectEditClick);
+elements.dockResizer?.addEventListener("pointerdown", beginDockResize);
+elements.dockResizer?.addEventListener("pointermove", moveDockResize);
+elements.dockResizer?.addEventListener("pointerup", endDockResize);
+elements.dockResizer?.addEventListener("pointercancel", endDockResize);
+elements.dockToggle?.addEventListener("click", toggleDockCollapsed);
+elements.dockResizer?.addEventListener("keydown", (event) => {
+  if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  const minimum = 168;
+  const maximum = Math.max(minimum, window.innerHeight - 170);
+  const next = event.key === "Home" ? minimum : event.key === "End" ? maximum :
+    state.dockHeight + (event.key === "ArrowUp" ? 24 : -24);
+  applyDockHeight(next);
+  updateVisiblePages();
+  positionImageEditControls();
+  scheduleStateSave();
+});
 elements.viewer.addEventListener("wheel", (event) => {
   if (!event.ctrlKey && !event.metaKey) {
     return;
@@ -3902,13 +4088,7 @@ elements.clearSelection.addEventListener("click", () => {
   clearLocalSession(true);
   setStatus("选区已清除。", "ready");
 });
-elements.compile.addEventListener("click", () => {
-  if (isWriteInteractionBusy()) return;
-  state.busyAction = "compile";
-  elements.compile.disabled = true;
-  updateManualEditAvailability();
-  post("compile", { queueVersion: state.manualEditQueueVersion });
-});
+elements.compile.addEventListener("click", requestCompile);
 elements.instruction.addEventListener("input", updateAnalyzeAvailability);
 elements.taskMode.addEventListener("change", () => {
   if (state.skillTaskRunning) return;
@@ -4104,6 +4284,7 @@ function postCandidateAction(type) {
 window.addEventListener("resize", () => {
   clearTimeout(state.resizeTimer);
   state.resizeTimer = setTimeout(() => {
+    applyDockHeight(state.dockHeight);
     if (state.fitMode && state.document) {
       void setScale(computeFitScale(), captureScaleAnchor(), true);
     } else {
@@ -4122,12 +4303,18 @@ function isEditableKeyboardTarget(target) {
 window.addEventListener("keydown", (event) => {
   const modifier = event.ctrlKey || event.metaKey;
   if (
-    state.imageEditDraft && modifier && !event.altKey && event.key === "Enter" &&
-    !event.isComposing && event.keyCode !== 229 && !isEditableKeyboardTarget(event.target)
+    modifier && !event.altKey && event.key === "Enter" && !event.isComposing && event.keyCode !== 229 &&
+    !isEditableKeyboardTarget(event.target)
   ) {
     event.preventDefault();
     event.stopPropagation();
-    queueImageEditDraft();
+    if (state.imageEditDraft) {
+      queueImageEditDraft();
+    } else if (state.directDraft) {
+      commitDirectDraft();
+    } else {
+      requestCompile();
+    }
     return;
   }
   if (state.interactionMode === "direct" && modifier && !event.altKey && !isEditableKeyboardTarget(event.target)) {
@@ -4331,7 +4518,7 @@ window.addEventListener("message", async (event) => {
       clearImageEditDraft();
       clearRegionSelection();
       updateClearSelectionAvailability();
-      setStatus(`图片尺寸调整已暂存，共 ${state.pendingManualEditCount} 项待编译。`, "ready");
+      setStatus(`图片尺寸调整已暂存，共 ${state.pendingManualEditCount} 项待编译。`, "success");
       break;
     }
     case "manualEditQueued": {
@@ -4357,10 +4544,12 @@ window.addEventListener("message", async (event) => {
         clearLocalSession(true);
       }
       setStatus(
-        state.manualEditMode === "tracked"
+        edit.structuralFormula
+          ? `完整公式结构已暂存，共 ${state.pendingManualEditCount} 项待编译。`
+          : state.manualEditMode === "tracked"
           ? `已加入待提交修订，共 ${state.pendingManualEditCount} 项。`
           : `编辑已暂存，共 ${state.pendingManualEditCount} 项待编译。`,
-        "ready"
+        "success"
       );
       break;
     }
@@ -4458,7 +4647,7 @@ window.addEventListener("message", async (event) => {
         await loadPdf({ preservePosition: true });
         finishCompileProgress("编译完成，PDF 已刷新");
         updateManualEditAvailability();
-        setStatus(warningCount ? `编译完成，日志中有 ${warningCount} 项警告。` : "编译完成，PDF 已刷新。", warningCount ? "warning" : "ready");
+        setStatus(warningCount ? `编译完成，日志中有 ${warningCount} 项警告。` : "编译完成，PDF 已刷新。", warningCount ? "warning" : "success");
       } catch (error) {
         finishCompileProgress("PDF 刷新失败", "error");
         setStatus(error.message || String(error), "error");

@@ -26,6 +26,7 @@ const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><met
 <header class="toolbar"><button id="previous-page" class="icon-button">‹</button><label class="page-control"><input id="page-number" type="number" min="1" value="1"><span id="page-count">/ …</span></label><button id="next-page" class="icon-button">›</button><span class="separator"></span><button id="zoom-out" class="icon-button">−</button><span id="zoom-value" class="zoom-value">125%</span><button id="zoom-in" class="icon-button">＋</button><button id="fit-width" class="toolbar-button">适合宽度</button><span class="separator"></span><button id="region-select" class="icon-button tool-toggle" aria-pressed="false"><span class="region-select-icon"></span></button><button id="clear-selection" class="icon-button" disabled>×</button><span class="toolbar-spacer"></span><button id="compile" class="toolbar-button">编译</button></header>
 <main class="layout">
   <section id="viewer" class="viewer"><div id="loading" class="loading"><div class="loading-meta"><span id="loading-label">正在初始化 PDF 审阅……</span><span id="loading-value">0%</span></div><div id="loading-track" class="loading-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="loading-fill" class="loading-fill"></div></div></div><div id="pages" class="pages"></div></section>
+  <div class="dock-resizer"><div id="dock-resize-handle" class="dock-resize-handle" role="separator" tabindex="0"></div><div id="dock-collapsed-progress" class="dock-collapsed-progress" role="status" data-kind="ready" data-has-progress="false"><span id="dock-collapsed-progress-label">工具区已收起</span><span id="dock-collapsed-progress-value"></span><div id="dock-collapsed-progress-track" class="dock-collapsed-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="dock-collapsed-progress-fill" class="dock-collapsed-progress-fill"></div></div></div><button id="dock-toggle" class="dock-toggle" type="button" aria-expanded="true">⌄</button></div>
   <section class="revision-dock">
     <div class="detail-bands">
       <details id="selection-details" class="detail-band" hidden><summary><span>PDF 选区</span><span id="selection-summary" class="detail-summary"></span></summary><div class="detail-content"><pre id="selection-text"></pre></div></details>
@@ -341,6 +342,14 @@ try {
   assert.ok(Number(await page.locator("#loading-track").getAttribute("aria-valuenow")) >= 75);
   await page.waitForFunction(() => document.querySelectorAll(".pdf-page canvas").length >= 1);
   await page.waitForFunction(() => document.querySelector('.pdf-page[data-render-stage="text"]'));
+  const expandedViewerHeight = await page.locator("#viewer").evaluate((element) => element.getBoundingClientRect().height);
+  await page.locator("#dock-toggle").click();
+  await page.waitForFunction(() => document.documentElement.classList.contains("dock-collapsed"));
+  assert.equal(await page.locator(".revision-dock").isVisible(), false);
+  assert.ok(await page.locator("#viewer").evaluate((element) => element.getBoundingClientRect().height) > expandedViewerHeight);
+  await page.locator("#dock-toggle").click();
+  await page.waitForFunction(() => !document.documentElement.classList.contains("dock-collapsed"));
+  assert.equal(await page.locator(".revision-dock").isVisible(), true);
   await page.waitForFunction(() => window.__startupPreviewEvents.some((event) => event.type === "snapshotRemoved"));
   const startupPreviewEvents = await page.evaluate(() => window.__startupPreviewEvents);
   assert.deepEqual(startupPreviewEvents.map((event) => event.type), ["shown", "immediateRemoved", "snapshotRemoved"]);
@@ -698,7 +707,8 @@ try {
   await page.waitForFunction(() => document.getElementById("compile").textContent === "应用 3 项并编译");
 
   const compileMessageCount = await page.evaluate(() => window.__messages.filter((message) => message.type === "compile").length);
-  await page.locator("#compile").click();
+  assert.match(await page.locator("#compile").getAttribute("title"), /Ctrl\+Enter/u);
+  await page.keyboard.press("Control+Enter");
   await page.waitForFunction((count) => window.__messages.filter((message) => message.type === "compile").length > count, compileMessageCount);
   const pendingCompile = await page.evaluate(() => window.__messages.findLast((message) => message.type === "compile"));
   assert.equal(pendingCompile.queueVersion, manualQueueVersion);
@@ -834,6 +844,12 @@ try {
   assert.equal(await page.locator("#compile-progress-value").textContent(), "15%");
   assert.equal(await page.locator("#compile-progress-label").textContent(), "正在执行第 1 遍 XeLaTeX");
   assert.equal(await page.locator("#compile-progress").evaluate((element) => element.classList.contains("is-indeterminate")), true);
+  await page.locator("#dock-toggle").click();
+  await page.waitForFunction(() => document.documentElement.classList.contains("dock-collapsed"));
+  assert.equal(await page.locator("#dock-collapsed-progress").isVisible(), true);
+  assert.equal(await page.locator("#dock-collapsed-progress-label").textContent(), "编译 · 正在执行第 1 遍 XeLaTeX");
+  assert.equal(await page.locator("#dock-collapsed-progress-value").textContent(), "15%");
+  assert.equal(await page.locator("#dock-collapsed-progress-track").getAttribute("aria-valuenow"), "15");
   await page.evaluate(() => window.dispatchEvent(new MessageEvent("message", { data: { type: "compiled", token: Date.now(), warnings: [] } })));
   await page.waitForFunction(() => window.__oldFirstPage && !window.__oldFirstPage.isConnected, undefined, { timeout: 15_000 });
   await page.waitForFunction(
@@ -846,6 +862,10 @@ try {
   undefined, { timeout: 15_000 });
   assert.equal(await page.locator("#compile-progress-value").textContent(), "100%");
   assert.equal(await page.locator("#compile-progress").getAttribute("data-kind"), "success");
+  assert.equal(await page.locator("#dock-collapsed-progress-value").textContent(), "100%");
+  assert.equal(await page.locator("#dock-collapsed-progress").getAttribute("data-kind"), "success");
+  await page.locator("#dock-toggle").click();
+  await page.waitForFunction(() => !document.documentElement.classList.contains("dock-collapsed"));
   await page.waitForFunction(() => {
     const viewerRect = document.getElementById("viewer").getBoundingClientRect();
     return [...document.querySelectorAll(".pdf-page")].some((item) => {

@@ -3,6 +3,7 @@ import {
   adjacentEditableLatexRange,
   isEditableLatexBoundary,
   isEditableLatexTextRange,
+  projectLatexSource,
   structuredCaretCandidates
 } from "./latexProjection";
 import {
@@ -32,6 +33,7 @@ export interface PendingManualEdit {
   page: number;
   rects: NormalizedManualEditRect[];
   baseDocumentHash: string;
+  structuralFormula?: boolean;
 }
 
 export interface ManualEditSourceRange {
@@ -332,9 +334,21 @@ export function createPendingManualEdit(
     throw new Error("手动修订页码无效。");
   }
   const normalizedRects = validateManualEditRects(rects);
-  const range = resolvedRange
-    ? validateResolvedManualEditRange(mapping, resolvedRange)
-    : resolveManualEditSourceRange(mapping);
+  let structuralFormula = false;
+  let range: ManualEditSourceRange;
+  if (resolvedRange) {
+    range = validateResolvedManualEditRange(mapping, resolvedRange);
+  } else {
+    try {
+      range = resolveManualEditSourceRange(mapping);
+    } catch (error) {
+      if (error instanceof ManualEditAmbiguityError || kind !== "delete") {
+        throw error;
+      }
+      range = resolveCompleteFormulaDeletionRange(mapping);
+      structuralFormula = true;
+    }
+  }
   validateInsertedTextForKind(kind, insertedText);
   return {
     id,
@@ -343,8 +357,121 @@ export function createPendingManualEdit(
     insertedText,
     page: mapping.selection.page,
     rects: normalizedRects,
-    baseDocumentHash: mapping.documentHash
+    baseDocumentHash: mapping.documentHash,
+    ...(structuralFormula ? { structuralFormula: true } : {})
   };
+}
+
+interface StructuredVisibleToken {
+  value: string;
+  start: number;
+  end: number;
+  formulaKey?: string;
+}
+
+interface StructuredFormulaGroup {
+  firstToken: number;
+  lastToken: number;
+}
+
+/**
+ * 公式在 PDF 中没有可逆的字符级源码映射。删除时仅接受完整覆盖公式投影的选区，
+ * 并将整个数学结构作为一个原子源码范围删除。
+ */
+function resolveCompleteFormulaDeletionRange(mapping: SourceMapping): ManualEditSourceRange {
+  if (mapping.selection.kind !== "text") {
+    throw new Error("包含公式的区域请选择完整公式与相邻正文，当前区域无法安全建立结构化删除范围。");
+  }
+  const selected = collapseVisibleText(mapping.selection.text).graphemes;
+  if (selected.length === 0) {
+    throw new Error("PDF 选区不包含可删除的文字或完整公式。");
+  }
+  const projection = projectLatexSource(mapping.sourceText);
+  const { tokens, formulas } = structuredVisibleTokens(mapping.sourceText);
+  const candidates: ManualEditSourceRange[] = [];
+  for (let start = 0; start <= tokens.length - selected.length; start += 1) {
+    if (!selected.every((value, index) => tokens[start + index].value === value)) continue;
+    const end = start + selected.length - 1;
+    const formulaKeys = new Set(tokens.slice(start, end + 1).flatMap((token) => token.formulaKey ? [token.formulaKey] : []));
+    if (formulaKeys.size === 0) continue;
+    const complete = [...formulaKeys].every((key) => {
+      const formula = formulas.get(key)!;
+      return start <= formula.firstToken && end >= formula.lastToken;
+    });
+    if (!complete) continue;
+    const localStart = tokens[start].start;
+    const localEnd = tokens[end].end;
+    const opaque = projection.opaqueSpans.filter((span) => span.start < localEnd && span.end > localStart);
+    if (opaque.some((span) => span.kind !== "math" || span.start < localStart || span.end > localEnd)) continue;
+    if (!isGraphemeBoundary(mapping.sourceText, localStart) || !isGraphemeBoundary(mapping.sourceText, localEnd)) continue;
+    candidates.push({
+      startOffset: mapping.startOffset + localStart,
+      endOffset: mapping.startOffset + localEnd,
+      sourceText: mapping.sourceText.slice(localStart, localEnd)
+    });
+  }
+  const unique = candidates.filter((candidate, index) => candidates.findIndex((other) =>
+    other.startOffset === candidate.startOffset && other.endOffset === candidate.endOffset
+  ) === index);
+  if (unique.length === 1) return unique[0];
+  if (unique.length > 1) {
+    throw new Error("所选公式在映射源码中存在多个结构化候选，无法安全确定删除位置。请缩小选区或交给 Agent 处理。");
+  }
+  throw new Error("选区包含公式或 LaTeX 符号，但未完整覆盖可安全删除的公式结构。请框选完整公式及需要删除的正文，或交给 Agent 处理。");
+}
+
+function structuredVisibleTokens(source: string): {
+  tokens: StructuredVisibleToken[];
+  formulas: Map<string, StructuredFormulaGroup>;
+} {
+  const projection = projectLatexSource(source);
+  const tokens: StructuredVisibleToken[] = projection.tokens.map((token) => ({ ...token }));
+  for (const span of projection.opaqueSpans.filter((item) => item.kind === "math")) {
+    const formulaKey = `${span.start}:${span.end}`;
+    for (const value of collapseVisibleText(mathToVisibleText(source.slice(span.start, span.end))).graphemes) {
+      tokens.push({ value, start: span.start, end: span.end, formulaKey });
+    }
+  }
+  tokens.sort((left, right) => left.start - right.start || left.end - right.end || Number(Boolean(left.formulaKey)) - Number(Boolean(right.formulaKey)));
+  const formulas = new Map<string, StructuredFormulaGroup>();
+  for (const [index, token] of tokens.entries()) {
+    if (!token.formulaKey) continue;
+    const existing = formulas.get(token.formulaKey);
+    formulas.set(token.formulaKey, existing
+      ? { firstToken: existing.firstToken, lastToken: index }
+      : { firstToken: index, lastToken: index });
+  }
+  return { tokens, formulas };
+}
+
+const MATH_COMMAND_VISIBLE: Record<string, string> = {
+  alpha: "α", beta: "β", gamma: "γ", delta: "δ", epsilon: "ε", zeta: "ζ", eta: "η", theta: "θ",
+  lambda: "λ", mu: "μ", nu: "ν", xi: "ξ", pi: "π", rho: "ρ", sigma: "σ", tau: "τ", phi: "φ",
+  chi: "χ", psi: "ψ", omega: "ω", Gamma: "Γ", Delta: "Δ", Theta: "Θ", Lambda: "Λ", Xi: "Ξ",
+  Pi: "Π", Sigma: "Σ", Phi: "Φ", Psi: "Ψ", Omega: "Ω", times: "×", cdot: "·", pm: "±",
+  mp: "∓", leq: "≤", geq: "≥", neq: "≠", approx: "≈", sim: "∼", to: "→", rightarrow: "→",
+  leftarrow: "←", infty: "∞", partial: "∂", nabla: "∇", degree: "°", percent: "%", sin: "sin",
+  cos: "cos", tan: "tan", log: "log", ln: "ln", exp: "exp", max: "max", min: "min"
+};
+
+function mathToVisibleText(value: string): string {
+  let result = value
+    .replace(/^\$\$?|\$\$?$/gu, "")
+    .replace(/^\\\(|\\\)$/gu, "")
+    .replace(/^\\\[|\\\]$/gu, "");
+  for (let pass = 0; pass < 6; pass += 1) {
+    const previous = result;
+    result = result
+      .replace(/\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/gu, "$1$2")
+      .replace(/\\(?:sqrt|mathrm|mathbf|mathit|mathsf|mathtt|text|operatorname)\s*(?:\[[^\]]*\])?\s*\{([^{}]*)\}/gu, "$1");
+    if (result === previous) break;
+  }
+  result = result
+    .replace(/\\(?:left|right|big|Big|bigl|bigr|Bigl|Bigr)\b/gu, "")
+    .replace(/\\([%&#_$\\{}])/gu, "$1")
+    .replace(/\\([A-Za-z]+)(?![A-Za-z])/gu, (_whole, name: string) => MATH_COMMAND_VISIBLE[name] ?? "")
+    .replace(/[{}_^]/gu, "");
+  return result;
 }
 
 function validateResolvedManualEditRange(
@@ -630,6 +757,9 @@ export function applyManualEdits(baseText: string, edits: readonly PendingManual
   validateNoOverlappingManualEdits(edits);
   const documentHash = hashDocument(baseText);
   for (const edit of edits) {
+    if (edit.structuralFormula) {
+      throw new Error("完整公式结构删除只支持直接编辑模式，不能生成修订痕迹。");
+    }
     if (edit.baseDocumentHash !== documentHash) {
       throw new Error(`手动修订 ${edit.id} 的基线源码校验失败。`);
     }
@@ -641,9 +771,7 @@ export function applyManualEdits(baseText: string, edits: readonly PendingManual
     }
     if (edit.startOffset === edit.endOffset) {
       validateOrdinaryInsertionPoint(baseText, edit.startOffset);
-    } else {
-      validateOrdinarySourceFragment(baseText, edit.startOffset, edit.sourceText);
-    }
+    } else validateOrdinarySourceFragment(baseText, edit.startOffset, edit.sourceText);
     validateInsertedTextForKind(edit.kind, edit.insertedText);
   }
 
@@ -776,9 +904,7 @@ function validateDirectManualEditBatch(
     }
     if (edit.startOffset === edit.endOffset) {
       validateOrdinaryInsertionPoint(baseText, edit.startOffset);
-    } else {
-      validateOrdinarySourceFragment(baseText, edit.startOffset, edit.sourceText);
-    }
+    } else validateManualEditTarget(baseText, edit);
     validateInsertedTextForKind(edit.kind, edit.insertedText);
     if (edit.kind === "delete" || edit.kind === "replace") {
       destructiveRanges.push({
@@ -877,6 +1003,38 @@ function validatePendingEditShape(edit: PendingManualEdit): void {
   validateManualEditRects(edit.rects);
   if (!/^[a-f0-9]{64}$/u.test(edit.baseDocumentHash)) {
     throw new Error(`手动修订 ${edit.id} 的基线哈希无效。`);
+  }
+  if (edit.structuralFormula !== undefined && edit.structuralFormula !== true) {
+    throw new Error(`手动修订 ${edit.id} 的公式结构标记无效。`);
+  }
+  if (edit.structuralFormula && (edit.kind !== "delete" || edit.insertedText.length > 0 || edit.endOffset <= edit.startOffset)) {
+    throw new Error(`手动修订 ${edit.id} 的公式结构删除类型无效。`);
+  }
+}
+
+function validateManualEditTarget(baseText: string, edit: PendingManualEdit): void {
+  if (edit.structuralFormula) {
+    validateCompleteFormulaSourceFragment(baseText, edit.startOffset, edit.sourceText);
+  } else {
+    validateOrdinarySourceFragment(baseText, edit.startOffset, edit.sourceText);
+  }
+}
+
+function validateCompleteFormulaSourceFragment(windowText: string, localStart: number, fragment: string): void {
+  const localEnd = localStart + fragment.length;
+  if (
+    fragment.length === 0 || !isGraphemeBoundary(windowText, localStart) ||
+    !isGraphemeBoundary(windowText, localEnd) || UNSAFE_TEXT_CONTROLS.test(fragment)
+  ) {
+    throw new Error("完整公式结构删除范围无效。");
+  }
+  const projection = projectLatexSource(windowText);
+  const opaque = projection.opaqueSpans.filter((span) => span.start < localEnd && span.end > localStart);
+  if (
+    !opaque.some((span) => span.kind === "math") ||
+    opaque.some((span) => span.kind !== "math" || span.start < localStart || span.end > localEnd)
+  ) {
+    throw new Error("完整公式结构删除必须完整覆盖公式，且不能包含引用、命令或其他受限结构。");
   }
 }
 

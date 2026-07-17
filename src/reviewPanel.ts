@@ -661,6 +661,9 @@ export class ReviewPanel implements vscode.Disposable {
         edit = createPendingManualEdit(mapping, kind, message.text, rects, undefined, resolvedRange);
       }
     }
+    if (queueMode === "tracked" && edit.structuralFormula) {
+      throw new Error("完整公式结构删除只支持直接编辑模式。请切换为直接编辑后重新框选，或交给 Agent 处理。");
+    }
     validateNoOverlappingDocumentEdits([...this.pendingManualEdits, edit]);
     this.pendingManualEditMode ??= queueMode;
     this.pendingManualEdits.push(edit);
@@ -1963,6 +1966,17 @@ export class ReviewPanel implements vscode.Disposable {
       </div>
       <div id="pages" class="pages"></div>
     </section>
+    <div class="dock-resizer">
+      <div id="dock-resize-handle" class="dock-resize-handle" role="separator" aria-label="调整审阅工具区高度" aria-orientation="horizontal" tabindex="0"></div>
+      <div id="dock-collapsed-progress" class="dock-collapsed-progress" role="status" aria-live="polite" data-kind="ready" data-has-progress="false">
+        <span id="dock-collapsed-progress-label">工具区已收起</span>
+        <span id="dock-collapsed-progress-value"></span>
+        <div id="dock-collapsed-progress-track" class="dock-collapsed-progress-track" role="progressbar" aria-label="后台任务进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="dock-collapsed-progress-fill" class="dock-collapsed-progress-fill"></div>
+        </div>
+      </div>
+      <button id="dock-toggle" class="dock-toggle" type="button" aria-expanded="true" aria-label="收起审阅工具区" title="收起审阅工具区，扩大 PDF 阅读视窗">⌄</button>
+    </div>
     <section class="revision-dock" aria-label="论文修改工具">
       <div class="detail-bands">
         <details id="selection-details" class="detail-band" hidden>
@@ -2228,7 +2242,8 @@ function manualEditForWebview(edit: PendingDocumentEdit): Record<string, unknown
     kind: edit.kind,
     page: edit.page,
     rects: edit.rects,
-    insertedText: edit.insertedText
+    insertedText: edit.insertedText,
+    ...(edit.structuralFormula ? { structuralFormula: true } : {})
   };
 }
 
