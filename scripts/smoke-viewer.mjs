@@ -36,6 +36,7 @@ const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><met
       <div class="manual-edit-actions"><button id="manual-insert-before" class="secondary-button" disabled>前插</button><button id="manual-insert-after" class="secondary-button" disabled>后插</button><button id="manual-replace" class="secondary-button" disabled>替换</button><button id="manual-delete" class="secondary-button" disabled>删除</button></div>
       <div class="manual-edit-history"><span id="pending-edit-count">0 项待提交</span><button id="manual-undo" class="icon-button" disabled>↶</button><button id="manual-clear" class="icon-button" disabled>×</button><button id="manual-accept-all" class="secondary-button" hidden>接受全部</button><button id="manual-reject-all" class="secondary-button" hidden>拒绝全部</button></div>
     </div>
+    <details id="pending-edits-details" class="pending-edits-details" hidden><summary><span>待编译编辑</span><span id="pending-edits-summary" class="detail-summary"></span></summary><ol id="pending-edits-list" class="pending-edits-list"></ol></details>
     <div class="prompt-bar"><div class="task-selector-row"><label for="task-mode">任务</label><select id="task-mode"><option value="revision">局部修订</option></select><span id="task-scope-note">需要 PDF 选区</span></div><div class="analysis-row"><textarea id="instruction" maxlength="4000" disabled></textarea><button id="analyze" class="primary-button" disabled>交给 AI 助手分析</button></div><div class="prompt-actions"><button id="manual-handoff" class="secondary-button" hidden>复制任务并打开 AI 助手</button><div id="candidate-actions" class="candidate-actions" hidden><button id="show-diff" class="secondary-button">查看差异</button><button id="apply" class="primary-button">应用并保存</button><button id="discard" class="secondary-button">放弃</button></div></div></div>
     <section id="skill-progress" class="skill-progress" hidden aria-live="polite" aria-label="Skill 任务进度"><div class="skill-progress-header"><div class="skill-progress-identity"><strong id="skill-progress-name">Skill 任务</strong><span id="skill-progress-state" class="skill-progress-state" data-state="pending">等待</span></div><div class="skill-progress-meta"><span id="skill-progress-elapsed">00:00</span><span id="skill-progress-value">0%</span></div></div><div id="skill-progress-track" class="skill-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="skill-progress-fill" class="skill-progress-fill"></div></div><ol id="skill-progress-stages" class="skill-progress-stages"></ol><div id="skill-progress-message" class="skill-progress-message"></div><details id="skill-progress-details" class="skill-progress-details"><summary>详细信息</summary><div id="skill-progress-events" class="skill-progress-events"></div></details><div id="skill-quality-gates" class="skill-quality-gates" hidden><div class="skill-quality-title">质量门禁</div><div id="skill-quality-list" class="skill-quality-list"></div></div></section>
     <div id="skill-artifacts" class="skill-artifacts" hidden></div>
@@ -1181,13 +1182,22 @@ try {
     } }));
   }, { requestId: locateImage.requestId, pageNumber: locateImage.page, bounds: locateImage.bounds, roughBounds: locateImage.roughBounds, pageWidth: locateImage.pageWidth, pageHeight: locateImage.pageHeight, imageObjectName: locateImage.imageObjectName });
   assert.equal(await page.locator(".region-selection-overlay").count(), 0);
-  assert.equal(await page.locator(".image-edit-controls").count(), 1);
+  assert.equal(await page.locator(".image-edit-floating-controls").count(), 1);
   assert.equal(await page.locator(".image-edit-original").count(), 1);
   assert.equal(await page.locator(".image-edit-preview").count(), 1);
-  assert.equal(await page.locator('.image-edit-controls button[aria-label="图片放大 5%"]').count(), 1);
-  await page.locator('.image-edit-controls button[aria-label="图片放大 5%"]').click();
+  assert.equal(await page.locator('.image-edit-floating-controls button[aria-label="图片放大 5%"]').count(), 1);
+  const imageControlBounds = await page.locator(".image-edit-floating-controls").evaluate((controls) => {
+    const control = controls.getBoundingClientRect();
+    const viewer = document.getElementById("viewer").getBoundingClientRect();
+    return { control: { left: control.left, top: control.top, right: control.right, bottom: control.bottom }, viewer: { left: viewer.left, top: viewer.top, right: viewer.right, bottom: viewer.bottom } };
+  });
+  assert.ok(imageControlBounds.control.left >= imageControlBounds.viewer.left);
+  assert.ok(imageControlBounds.control.top >= imageControlBounds.viewer.top);
+  assert.ok(imageControlBounds.control.right <= imageControlBounds.viewer.right);
+  assert.ok(imageControlBounds.control.bottom <= imageControlBounds.viewer.bottom);
+  await page.locator('.image-edit-floating-controls button[aria-label="图片放大 5%"]').click();
   assert.match(await page.locator(".image-edit-value").textContent(), /105%/u);
-  await page.locator(".image-edit-controls button", { hasText: "确认" }).click();
+  await page.keyboard.press("Control+Enter");
   const queueImage = await page.evaluate(() => window.__messages.findLast((message) => message.type === "queueImageEdit"));
   assert.equal(queueImage.targetId, "image-target-smoke");
   assert.equal(queueImage.factor, 1.05);
@@ -1216,7 +1226,7 @@ try {
     canRedo: false,
     manualEditMode: "direct"
   } })), { requestId: queueImage.requestId, edit: imageEdit, edits: directEdits, queueVersion: manualQueueVersion });
-  assert.equal(await page.locator(".image-edit-controls").count(), 0);
+  assert.equal(await page.locator(".image-edit-floating-controls").count(), 0);
   assert.ok((await page.locator(".manual-edit-image").count()) >= 1);
   assert.equal(await page.locator("#compile").textContent(), `应用 ${directEdits.length} 项并编译`);
   await page.locator("#direct-edit").click();

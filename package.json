@@ -2,7 +2,7 @@
   "name": "circletex",
   "displayName": "CircleTeX",
   "description": "在 PDF 审阅界面中直接修改 LaTeX 正文与图片尺寸，并从 main.tex 导出保留论文版式、公式全部可编辑的 MathType Word。",
-  "version": "0.10.9",
+  "version": "0.11.0",
   "publisher": "local",
   "license": "SEE LICENSE IN LICENSE.txt",
   "engines": {

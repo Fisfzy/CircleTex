@@ -335,9 +335,9 @@ button:disabled { opacity: 0.45; cursor: default; }
   max-height: 92px;
   overflow: hidden;
   padding: 2px 4px;
-  color: #b20e1b;
-  background: rgb(255 248 248 / 0.96);
-  border: 1px solid rgb(209 36 47 / 0.72);
+  color: var(--vscode-testing-iconPassed, #22863a);
+  background: rgb(240 250 242 / 0.96);
+  border: 1px solid color-mix(in srgb, var(--vscode-testing-iconPassed, #22863a) 72%, transparent);
   border-radius: 2px;
   box-shadow: 0 1px 3px rgb(0 0 0 / 0.18);
   font-family: var(--vscode-font-family);
@@ -355,7 +355,7 @@ button:disabled { opacity: 0.45; cursor: default; }
   z-index: 2;
   width: 2px;
   min-height: 8px;
-  background: #d1242f;
+  background: var(--vscode-testing-iconPassed, #22863a);
   box-shadow: 0 0 0 1px rgb(255 255 255 / 0.7);
   transform: translateX(-1px);
 }
@@ -364,7 +364,7 @@ button:disabled { opacity: 0.45; cursor: default; }
   z-index: 2;
   width: 10px;
   height: 1px;
-  background: #d1242f;
+  background: var(--vscode-testing-iconPassed, #22863a);
 }
 .manual-edit-insertion-lead::after {
   content: "";
@@ -381,12 +381,12 @@ button:disabled { opacity: 0.45; cursor: default; }
 .manual-edit-insertion-lead-insertBefore::after,
 .manual-edit-insertion-lead-replace::after {
   left: -1px;
-  border-right: 4px solid #d1242f;
+  border-right: 4px solid var(--vscode-testing-iconPassed, #22863a);
 }
 .manual-edit-insertion-lead-insertAfter { transform: translate(-100%, 1px); }
 .manual-edit-insertion-lead-insertAfter::after {
   right: -1px;
-  border-left: 4px solid #d1242f;
+  border-left: 4px solid var(--vscode-testing-iconPassed, #22863a);
 }
 
 .direct-edit-draft-overlay {
@@ -638,6 +638,39 @@ pre {
   gap: 6px;
   padding: 10px 12px 8px;
 }
+.pending-edits-details {
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+.pending-edits-details summary {
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 12px;
+  cursor: pointer;
+  list-style: none;
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+}
+.pending-edits-details summary::-webkit-details-marker { display: none; }
+.pending-edits-details summary::before { content: "›"; font-size: 16px; transition: transform 100ms ease-out; }
+.pending-edits-details[open] summary::before { transform: rotate(90deg); }
+.pending-edits-list {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding: 0 12px 8px 30px;
+}
+.pending-edit-item {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  min-height: 27px;
+}
+.pending-edit-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pending-edit-item .icon-button { width: 24px; height: 24px; }
 .region-selection-outline-image {
   border: 2px solid var(--vscode-focusBorder, #007acc);
   background: rgb(0 122 204 / 0.035);
@@ -674,8 +707,9 @@ pre {
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--vscode-editor-background) 70%, transparent);
   transition: left 100ms ease, top 100ms ease, width 100ms ease, height 100ms ease;
 }
-.image-edit-controls {
-  position: absolute;
+.image-edit-floating-controls {
+  position: fixed;
+  z-index: 30;
   display: flex;
   align-items: center;
   gap: 4px;
@@ -686,17 +720,18 @@ pre {
   background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
   color: var(--vscode-editorWidget-foreground, var(--vscode-editor-foreground));
   box-shadow: 0 3px 12px rgba(0, 0, 0, .28);
-  transform: translate(6px, -50%);
   pointer-events: auto;
   white-space: nowrap;
+  overflow: hidden;
 }
-.image-edit-controls button {
+.image-edit-floating-controls button {
   min-width: 30px;
   min-height: 28px;
   padding: 2px 7px;
 }
 .image-edit-value {
-  min-width: 96px;
+  min-width: 0;
+  flex: 1 1 96px;
   max-width: 220px;
   overflow: hidden;
   text-overflow: ellipsis;

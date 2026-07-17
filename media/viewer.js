@@ -35,6 +35,9 @@ const elements = {
   manualAcceptAll: document.getElementById("manual-accept-all"),
   manualRejectAll: document.getElementById("manual-reject-all"),
   pendingEditCount: document.getElementById("pending-edit-count"),
+  pendingEditsDetails: document.getElementById("pending-edits-details"),
+  pendingEditsSummary: document.getElementById("pending-edits-summary"),
+  pendingEditsList: document.getElementById("pending-edits-list"),
   selectionDetails: document.getElementById("selection-details"),
   selectionSummary: document.getElementById("selection-summary"),
   selectionText: document.getElementById("selection-text"),
@@ -206,6 +209,7 @@ const state = {
   skillProgressStages: [],
   skillProgressEvents: [],
   scrollFrame: 0,
+  imageControlFrame: 0,
   saveTimer: undefined,
   resizeTimer: undefined,
   wheelTimer: undefined,
@@ -625,6 +629,7 @@ function scheduleVisibleUpdate() {
   state.scrollFrame = requestAnimationFrame(() => {
     state.scrollFrame = 0;
     updateVisiblePages();
+    positionImageEditControls();
   });
 }
 
@@ -770,9 +775,7 @@ async function renderPageRecord(record, { primary = false } = {}) {
     record.status = "canvas";
     record.shell.dataset.renderStage = "canvas";
     record.shell.querySelector(":scope > .page-refresh-snapshot")?.remove();
-    const imageBoundaryPromise = cachePageImageBoundaries(
-      record, page, viewport, documentGeneration, renderGeneration, scale
-    );
+    scheduleImageBoundaryCache(record, page, viewport, documentGeneration, renderGeneration, scale, primary);
     state.startupPreview = undefined;
     if (primary) {
       reportPerformance("PDF 首屏 Canvas", canvasStartedAt);
@@ -789,8 +792,6 @@ async function renderPageRecord(record, { primary = false } = {}) {
         viewport
       });
       await record.textLayer.render();
-      if (isRenderStale(record, documentGeneration, renderGeneration, scale)) return;
-      await imageBoundaryPromise;
       if (isRenderStale(record, documentGeneration, renderGeneration, scale)) return;
       record.textLayerReady = true;
       record.status = "rendered";
@@ -1333,6 +1334,15 @@ async function cachePageImageBoundaries(record, page, viewport, documentGenerati
   }
 }
 
+function scheduleImageBoundaryCache(record, page, viewport, documentGeneration, renderGeneration, scale, primary) {
+  const run = () => void cachePageImageBoundaries(record, page, viewport, documentGeneration, renderGeneration, scale);
+  if (typeof window.requestIdleCallback === "function") {
+    window.requestIdleCallback(run, { timeout: primary ? 450 : 1_200 });
+  } else {
+    setTimeout(run, primary ? 50 : 180);
+  }
+}
+
 function extractPdfImageBoundaries(operatorList, viewport, pageWidth, pageHeight) {
   const boundaries = [];
   const stack = [];
@@ -1467,6 +1477,7 @@ function clearImageEditDraft() {
   state.imageLocateRequestId = undefined;
   state.imageQueueRequestId = undefined;
   for (const overlay of document.querySelectorAll(".image-edit-draft-overlay")) overlay.remove();
+  document.querySelector(".image-edit-floating-controls")?.remove();
 }
 
 function adjustImageEditDraft(direction) {
@@ -1511,6 +1522,7 @@ function cancelImageEditDraft() {
 
 function renderImageEditDraft() {
   for (const overlay of document.querySelectorAll(".image-edit-draft-overlay")) overlay.remove();
+  document.querySelector(".image-edit-floating-controls")?.remove();
   const draft = state.imageEditDraft;
   const record = draft ? state.pageStates[draft.page - 1] : undefined;
   const rect = draft?.rects?.[0];
@@ -1542,12 +1554,10 @@ function renderImageEditDraft() {
     height: scaledHeight
   });
   const controls = document.createElement("div");
-  controls.className = "image-edit-controls";
+  controls.className = "image-edit-floating-controls";
   controls.addEventListener("pointerdown", (event) => event.stopPropagation());
   controls.addEventListener("pointerup", (event) => event.stopPropagation());
   controls.addEventListener("click", (event) => event.stopPropagation());
-  controls.style.left = `${clamp(rect.x + rect.width, 0.05, 0.98) * 100}%`;
-  controls.style.top = `${clamp(rect.y, 0.02, 0.96) * 100}%`;
   const enlarge = document.createElement("button");
   enlarge.type = "button";
   enlarge.textContent = "↑";
@@ -1574,8 +1584,61 @@ function renderImageEditDraft() {
   cancel.textContent = "取消";
   cancel.addEventListener("click", cancelImageEditDraft);
   controls.append(enlarge, shrink, value, confirm, cancel);
-  overlay.append(original, preview, controls);
+  overlay.append(original, preview);
   record.shell.append(overlay);
+  document.body.append(controls);
+  requestAnimationFrame(positionImageEditControls);
+}
+
+function positionImageEditControls() {
+  const controls = document.querySelector(".image-edit-floating-controls");
+  const draft = state.imageEditDraft;
+  const record = draft ? state.pageStates[draft.page - 1] : undefined;
+  const rect = draft?.rects?.[0];
+  if (!controls || !record || !rect) return;
+  const viewerRect = elements.viewer.getBoundingClientRect();
+  const pageRect = record.shell.getBoundingClientRect();
+  const imageRect = {
+    left: pageRect.left + rect.x * pageRect.width,
+    top: pageRect.top + rect.y * pageRect.height,
+    right: pageRect.left + (rect.x + rect.width) * pageRect.width,
+    bottom: pageRect.top + (rect.y + rect.height) * pageRect.height
+  };
+  const visible = imageRect.right > viewerRect.left && imageRect.left < viewerRect.right &&
+    imageRect.bottom > viewerRect.top && imageRect.top < viewerRect.bottom;
+  controls.hidden = !visible;
+  if (!visible) return;
+  const margin = 8;
+  controls.style.maxWidth = `${Math.max(120, Math.floor(viewerRect.width - margin * 2))}px`;
+  controls.style.visibility = "hidden";
+  controls.style.left = "0px";
+  controls.style.top = "0px";
+  controls.hidden = false;
+  const controlRect = controls.getBoundingClientRect();
+  const centerY = imageRect.top + (imageRect.bottom - imageRect.top) / 2;
+  const centerX = imageRect.left + (imageRect.right - imageRect.left) / 2;
+  let left;
+  let top;
+  if (viewerRect.right - imageRect.right >= controlRect.width + margin) {
+    left = imageRect.right + margin;
+    top = centerY - controlRect.height / 2;
+  } else if (imageRect.left - viewerRect.left >= controlRect.width + margin) {
+    left = imageRect.left - controlRect.width - margin;
+    top = centerY - controlRect.height / 2;
+  } else if (viewerRect.bottom - imageRect.bottom >= controlRect.height + margin) {
+    left = centerX - controlRect.width / 2;
+    top = imageRect.bottom + margin;
+  } else {
+    left = centerX - controlRect.width / 2;
+    top = imageRect.top - controlRect.height - margin;
+  }
+  const minimumLeft = viewerRect.left + margin;
+  const minimumTop = viewerRect.top + margin;
+  const maximumLeft = Math.max(minimumLeft, viewerRect.right - controlRect.width - margin);
+  const maximumTop = Math.max(minimumTop, viewerRect.bottom - controlRect.height - margin);
+  controls.style.left = `${Math.round(clamp(left, minimumLeft, maximumLeft))}px`;
+  controls.style.top = `${Math.round(clamp(top, minimumTop, maximumTop))}px`;
+  controls.style.visibility = "visible";
 }
 
 function renderRegionDraft() {
@@ -2920,6 +2983,7 @@ function isWriteInteractionBusy() {
     "queueImageEdit",
     "undoManualEdit",
     "redoManualEdit",
+    "removeManualEdit",
     "clearManualEdits",
     "showManualEditsDiff",
     "resolveTrackedRevisions"
@@ -2994,6 +3058,7 @@ function updateManualEditAvailability() {
     ? `有 ${pendingCount} 项编辑将在下次编译时写入 main.tex。`
     : "当前没有待编译编辑。";
   elements.compile.textContent = pendingCount > 0 ? `应用 ${pendingCount} 项并编译` : "编译";
+  renderPendingManualEditList();
 
   const pendingBlocksAi = pendingCount > 0;
   elements.compile.disabled = historyBusy || Boolean(state.directDraft);
@@ -3074,7 +3139,57 @@ function setPendingManualEdits(rawEdits, rawCount, history = {}) {
     state.manualEditMode = history.manualEditMode;
   }
   renderAllManualEditOverlays();
+  renderPendingManualEditList();
   updateManualEditAvailability();
+}
+
+function renderPendingManualEditList() {
+  const edits = state.pendingManualEdits;
+  elements.pendingEditsDetails.hidden = edits.length === 0;
+  if (edits.length === 0) {
+    elements.pendingEditsDetails.open = false;
+    elements.pendingEditsSummary.textContent = "";
+    elements.pendingEditsList.replaceChildren();
+    return;
+  }
+  elements.pendingEditsSummary.textContent = `${edits.length} 项`;
+  const items = edits.map((edit) => {
+    const item = document.createElement("li");
+    item.className = "pending-edit-item";
+    const label = document.createElement("span");
+    label.className = "pending-edit-label";
+    label.textContent = pendingEditLabel(edit);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "icon-button";
+    remove.textContent = "×";
+    remove.title = "移除此项待编译编辑";
+    remove.setAttribute("aria-label", "移除此项待编译编辑");
+    remove.disabled = isWriteInteractionBusy();
+    remove.addEventListener("click", () => removePendingManualEdit(edit.id));
+    item.append(label, remove);
+    return item;
+  });
+  elements.pendingEditsList.replaceChildren(...items);
+}
+
+function pendingEditLabel(edit) {
+  const page = `第 ${edit.page} 页`;
+  if (edit.editType === "image") {
+    const delta = Math.round((edit.factor - 1) * 100);
+    return `${page} 图片${delta >= 0 ? "放大" : "缩小"} ${Math.abs(delta)}%`;
+  }
+  const labels = { insertBefore: "前插", insertAfter: "后插", replace: "替换", delete: "删除" };
+  const text = typeof edit.insertedText === "string" ? edit.insertedText.replace(/\s+/gu, " ").trim() : "";
+  return text ? `${page} ${labels[edit.kind] ?? "编辑"}：${text.slice(0, 48)}` : `${page} ${labels[edit.kind] ?? "编辑"}`;
+}
+
+function removePendingManualEdit(editId) {
+  if (!editId || isWriteInteractionBusy()) return;
+  state.busyAction = "removeManualEdit";
+  updateManualEditAvailability();
+  setStatus("正在移除待编译编辑……", "busy");
+  post("removeManualEdit", { editId, queueVersion: state.manualEditQueueVersion });
 }
 
 function updateManualEditQueueVersion(value) {
@@ -3994,6 +4109,7 @@ window.addEventListener("resize", () => {
     } else {
       updateVisiblePages();
     }
+    positionImageEditControls();
   }, 180);
 });
 
@@ -4005,6 +4121,15 @@ function isEditableKeyboardTarget(target) {
 
 window.addEventListener("keydown", (event) => {
   const modifier = event.ctrlKey || event.metaKey;
+  if (
+    state.imageEditDraft && modifier && !event.altKey && event.key === "Enter" &&
+    !event.isComposing && event.keyCode !== 229 && !isEditableKeyboardTarget(event.target)
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    queueImageEditDraft();
+    return;
+  }
   if (state.interactionMode === "direct" && modifier && !event.altKey && !isEditableKeyboardTarget(event.target)) {
     const key = event.key.toLowerCase();
     if (key === "y" || (key === "z" && event.shiftKey)) {
@@ -4186,7 +4311,7 @@ window.addEventListener("message", async (event) => {
       renderImageEditDraft();
       updateManualEditAvailability();
       updateClearSelectionAvailability();
-      setStatus("图片已定位。使用上下箭头调整候选尺寸，确认后再点击编译。", "ready");
+      setStatus("图片已定位。使用上下箭头调整候选尺寸，按 Ctrl+Enter 暂存后再编译。", "ready");
       break;
     }
     case "imageEditQueued": {
@@ -4241,7 +4366,7 @@ window.addEventListener("message", async (event) => {
     }
     case "manualEditsState":
       updateManualEditQueueVersion(message.queueVersion);
-      if (["undoManualEdit", "redoManualEdit", "clearManualEdits"].includes(state.busyAction)) {
+      if (["undoManualEdit", "redoManualEdit", "removeManualEdit", "clearManualEdits"].includes(state.busyAction)) {
         state.busyAction = undefined;
       }
       setPendingManualEdits(message.edits, message.count, message);
@@ -4258,7 +4383,9 @@ window.addEventListener("message", async (event) => {
           : state.pendingManualEdits.slice(0, -1);
         setPendingManualEdits(edits, message.count, message);
       }
-      setStatus(`已撤销最近一项编辑，剩余 ${state.pendingManualEditCount} 项待编译。`, "ready");
+      setStatus(message.removedFromQueue
+        ? `已移除该项编辑，剩余 ${state.pendingManualEditCount} 项待编译。`
+        : `已撤销最近一项编辑，剩余 ${state.pendingManualEditCount} 项待编译。`, "ready");
       break;
     }
     case "manualEditRestored": {
@@ -4339,7 +4466,7 @@ window.addEventListener("message", async (event) => {
       break;
     }
     case "notice":
-      if (["compile", "undoManualEdit", "redoManualEdit", "clearManualEdits", "showManualEditsDiff", "resolveTrackedRevisions"].includes(state.busyAction)) {
+      if (["compile", "undoManualEdit", "redoManualEdit", "removeManualEdit", "clearManualEdits", "showManualEditsDiff", "resolveTrackedRevisions"].includes(state.busyAction)) {
         state.busyAction = undefined;
         updateManualEditAvailability();
       }
@@ -4373,7 +4500,6 @@ window.addEventListener("message", async (event) => {
       if (message.action === "locateImage") {
         state.imageLocateRequestId = undefined;
         clearImageEditDraft();
-        clearRegionSelection();
       }
       if (message.action === "queueImageEdit") {
         state.imageQueueRequestId = undefined;
@@ -4393,6 +4519,7 @@ window.addEventListener("message", async (event) => {
         "queueImageEdit",
         "undoManualEdit",
         "redoManualEdit",
+        "removeManualEdit",
         "clearManualEdits",
         "showManualEditsDiff",
         "resolveTrackedRevisions"
