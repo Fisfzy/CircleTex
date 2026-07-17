@@ -3,10 +3,13 @@
 .gitignore
 src/**
 scripts/**
+!bundled-skills/**
 artifacts/**
 node_modules/**
 tsconfig.json
 package-lock.json
 out/test/**
 **/*.map
+**/__pycache__/**
+**/*.pyc
 *.vsix

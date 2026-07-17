@@ -180,7 +180,7 @@ function validatePermissions(value: SkillPermissionProfile): void {
     !value ||
     !["analysis", "artifact"].includes(value.taskType) ||
     !["document", "selection", "either"].includes(value.scope) ||
-    !["document", "document-resources"].includes(value.inputPreset) ||
+    !["document", "document-resources", "document-workspace"].includes(value.inputPreset) ||
     value.network !== false ||
     !Array.isArray(value.outputExtensions) ||
     value.outputExtensions.length < 1 || value.outputExtensions.length > 16 ||
@@ -188,7 +188,9 @@ function validatePermissions(value: SkillPermissionProfile): void {
     !Array.isArray(value.declaredCommands) || value.declaredCommands.length > 32 ||
     value.declaredCommands.some((command) => !/^[A-Za-z0-9._+-]{1,80}$/.test(command)) ||
     !Array.isArray(value.supportedAgents) || value.supportedAgents.length !== 1 || value.supportedAgents[0] !== "codex" ||
-    !Number.isInteger(value.timeoutMinutes) || value.timeoutMinutes < 1 || value.timeoutMinutes > 60
+    !Number.isInteger(value.timeoutMinutes) || value.timeoutMinutes < 1 || value.timeoutMinutes > 240 ||
+    (value.writableWorkDirectory !== undefined && typeof value.writableWorkDirectory !== "boolean") ||
+    (value.agentIndependent !== undefined && typeof value.agentIndependent !== "boolean")
   ) {
     throw new Error("Skill 权限清单格式无效。");
   }

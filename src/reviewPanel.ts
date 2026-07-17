@@ -175,6 +175,9 @@ export class ReviewPanel implements vscode.Disposable {
       throw new Error("正在应用修订，暂时不能启动编译。");
     }
     if (!fromApply && this.pendingManualEdits.length > 0) {
+      if (await this.discardStaleManualEditsBeforeCompile()) {
+        return;
+      }
       try {
         await this.applyPendingManualEditsAndCompile();
       } catch (error) {
@@ -198,6 +201,49 @@ export class ReviewPanel implements vscode.Disposable {
       this.post({ type: "error", action: "compile", message });
       this.showCompileError(message);
     }
+  }
+
+  /**
+   * 手动修改 main.tex 后，旧 PDF 编辑不能安全重放；允许用户明确放弃队列后继续编译。
+   */
+  private async discardStaleManualEditsBeforeCompile(): Promise<boolean> {
+    await this.ensureSourceSaved();
+    const source = await fs.readFile(this.project.tex, "utf8");
+    if (!this.pendingManualEdits.some((edit) => edit.baseDocumentHash !== sha256(source))) {
+      return false;
+    }
+    const queueVersion = this.manualQueueVersion;
+    const editCount = this.pendingManualEdits.length + this.redoManualEdits.length;
+    const action = await vscode.window.showWarningMessage(
+      "main.tex 已在 PDF 手动编辑建立后发生变化。为避免把旧选区写入错误位置，不能继续提交该队列。",
+      { modal: true, detail: `可放弃 ${editCount} 项过期编辑，直接编译当前 main.tex。` },
+      "放弃过期编辑并编译"
+    );
+    if (action !== "放弃过期编辑并编译") {
+      this.sendManualEditsState();
+      return true;
+    }
+    if (this.manualQueueVersion !== queueVersion) {
+      throw new Error("手动编辑队列在确认期间发生了变化，未放弃过期队列。");
+    }
+    this.pendingManualEdits.splice(0);
+    this.redoManualEdits.splice(0);
+    this.releaseManualEditMode();
+    this.manualQueueVersion += 1;
+    this.clearManualPreview();
+    this.post({
+      type: "manualEditsCleared",
+      edits: [],
+      count: 0,
+      queueVersion: this.manualQueueVersion,
+      canUndo: false,
+      canRedo: false,
+      manualEditMode: this.manualEditModeForQueue(),
+      configuredManualEditMode: this.configuredManualEditMode(),
+      modeLocked: false
+    });
+    this.post({ type: "notice", message: "已放弃过期 PDF 手动编辑，正在编译当前 main.tex。" });
+    return false;
   }
 
   private async runCompileCore(validateBeforePublish?: CompilePublishValidator): Promise<CompileResult> {
@@ -998,7 +1044,7 @@ export class ReviewPanel implements vscode.Disposable {
     if (skill.permissions.scope === "document" && useSelection) {
       throw new Error("该 Skill 只支持整篇论文任务。");
     }
-    if (selectedAssistantId() !== "codex") {
+    if (!skill.permissions.agentIndependent && selectedAssistantId() !== "codex") {
       throw new Error("首版外部 Skill 任务仅支持 Codex。请在左侧设置中将 AI 助手切换为 Codex 后再执行。");
     }
     await this.ensureSourceSaved();
@@ -1036,6 +1082,7 @@ export class ReviewPanel implements vscode.Disposable {
           type: "skillTaskCompleted",
           summary: result.summary,
           warnings: result.warnings,
+          qualityGates: result.qualityGates,
           publishedDirectory: result.publishedDirectory,
           artifacts: result.artifacts.map((artifact, index) => ({
             index,
@@ -1878,7 +1925,12 @@ export class ReviewPanel implements vscode.Disposable {
   </header>
   <main class="layout">
     <section id="viewer" class="viewer" aria-label="连续 PDF 页面">
-      <div id="loading" class="loading">正在载入 main.pdf……</div>
+      <div id="loading" class="loading" aria-live="polite">
+        <div class="loading-meta"><span id="loading-label">正在初始化 PDF 审阅……</span><span id="loading-value">0%</span></div>
+        <div id="loading-track" class="loading-track" role="progressbar" aria-label="PDF 打开进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="loading-fill" class="loading-fill"></div>
+        </div>
+      </div>
       <div id="pages" class="pages"></div>
     </section>
     <section class="revision-dock" aria-label="论文修改工具">
@@ -1939,6 +1991,31 @@ export class ReviewPanel implements vscode.Disposable {
           </div>
         </div>
       </div>
+      <section id="skill-progress" class="skill-progress" hidden aria-live="polite" aria-label="Skill 任务进度">
+        <div class="skill-progress-header">
+          <div class="skill-progress-identity">
+            <strong id="skill-progress-name">Skill 任务</strong>
+            <span id="skill-progress-state" class="skill-progress-state" data-state="pending">等待</span>
+          </div>
+          <div class="skill-progress-meta">
+            <span id="skill-progress-elapsed">00:00</span>
+            <span id="skill-progress-value">0%</span>
+          </div>
+        </div>
+        <div id="skill-progress-track" class="skill-progress-track" role="progressbar" aria-label="Skill 总进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="skill-progress-fill" class="skill-progress-fill"></div>
+        </div>
+        <ol id="skill-progress-stages" class="skill-progress-stages"></ol>
+        <div id="skill-progress-message" class="skill-progress-message"></div>
+        <details id="skill-progress-details" class="skill-progress-details">
+          <summary>详细信息</summary>
+          <div id="skill-progress-events" class="skill-progress-events"></div>
+        </details>
+        <div id="skill-quality-gates" class="skill-quality-gates" hidden>
+          <div class="skill-quality-title">质量门禁</div>
+          <div id="skill-quality-list" class="skill-quality-list"></div>
+        </div>
+      </section>
       <div id="skill-artifacts" class="skill-artifacts" hidden aria-live="polite"></div>
       <div id="compile-progress" class="compile-progress" hidden aria-live="polite">
         <div class="compile-progress-meta"><span id="compile-progress-label">准备编译</span><span id="compile-progress-value">0%</span></div>

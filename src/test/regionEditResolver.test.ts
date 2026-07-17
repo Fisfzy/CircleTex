@@ -65,6 +65,12 @@ describe("区域框选到连续 LaTeX 正文范围", () => {
     assert.equal(range.sourceText, "加粗正文");
   });
 
+  it("允许附录目录中的纯排版命令跨行包围普通正文", () => {
+    const source = "\\hspace*{2em}第一项\\par\n\\hspace*{2em}第二项";
+    const range = resolveRegionEditSourceRange(mapping(source, ["第一项", "第二项"]));
+    assert.equal(range.sourceText, "第一项\\par\n\\hspace*{2em}第二项");
+  });
+
   it("拒绝跨公式、引用、未知命令和注释", () => {
     const unsafe = [
       ["公式前甲乙$K_I$丙丁公式后", ["甲乙", "丙丁"]],

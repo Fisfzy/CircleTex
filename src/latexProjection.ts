@@ -163,7 +163,8 @@ export function projectLatexSource(source: string): LatexProjection {
         index = commandEnd;
         continue;
       }
-      if (SPACING_COMMANDS.has(command.name) || /^[,;:! ]$/u.test(command.name)) {
+      const normalizedCommandName = command.name.replace(/\*$/u, "");
+      if (SPACING_COMMANDS.has(normalizedCommandName) || command.name === "par" || /^[,;:! ]$/u.test(command.name)) {
         const commandEnd = consumeImmediateGroups(source, command.end, end, 1).end;
         addOpaque(index, commandEnd, "command");
         index = commandEnd;

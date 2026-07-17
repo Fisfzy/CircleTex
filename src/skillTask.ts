@@ -2,14 +2,18 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { inflateRawSync } from "node:zlib";
 import { findExecutable, runProcess } from "./processRunner";
 import { isExecutableBinaryFile } from "./skillPackage";
 import { SkillRegistry } from "./skillRegistry";
 import {
   ImportedSkill,
+  SkillProgressStage,
+  SkillRunnerProgress,
   SkillTaskArtifact,
   SkillTaskHistoryEntry,
   SkillTaskProgress,
+  SkillTaskQualityGate,
   SkillTaskResult
 } from "./skillTypes";
 import { PdfSelection, ProjectPaths } from "./types";
@@ -20,28 +24,32 @@ const MAX_OUTPUT_FILES = 100;
 const MAX_OUTPUT_BYTES = 500 * 1024 * 1024;
 const FORBIDDEN_OUTPUT_EXTENSIONS = new Set([".exe", ".dll", ".com", ".msi", ".scr", ".sys", ".bat", ".cmd", ".ps1"]);
 const RESOURCE_EXTENSIONS = new Set([".bib", ".cls", ".sty", ".bst", ".png", ".jpg", ".jpeg", ".pdf", ".svg", ".eps"]);
+const MATHTYPE_PROG_ID = "Equation.DSMT4";
 
 export interface SkillAgentResult {
   status: "success" | "failed";
   summary: string;
   artifacts: Array<{ path: string; type: string; description: string }>;
   warnings: string[];
+  qualityGates?: SkillTaskQualityGate[];
 }
 
 export interface SkillAgentRunContext {
   taskRoot: string;
   inputRoot: string;
   skillRoot: string;
+  workRoot?: string;
   outputRoot: string;
   schemaPath: string;
   responsePath: string;
   skill: ImportedSkill;
   signal: AbortSignal;
   onOutput?: (text: string) => void;
+  onProgress?: (progress: SkillRunnerProgress) => void;
 }
 
 export interface SkillAgentRunner {
-  readonly id: "codex";
+  readonly id: "codex" | "circletex";
   run(context: SkillAgentRunContext): Promise<SkillAgentResult>;
 }
 
@@ -99,7 +107,7 @@ export interface RunSkillTaskOptions {
 export class SkillTaskService {
   public constructor(
     private readonly registry: SkillRegistry,
-    private readonly createRunner: (command: string) => SkillAgentRunner = (command) => new CodexSkillRunner(command)
+    private readonly createRunner: (command: string, skill: ImportedSkill) => SkillAgentRunner = (command) => new CodexSkillRunner(command)
   ) {}
 
   public async run(options: RunSkillTaskOptions): Promise<SkillTaskResult> {
@@ -108,14 +116,19 @@ export class SkillTaskService {
     const taskRoot = await fs.mkdtemp(path.join(os.tmpdir(), `circletex-skill-${taskId}-`));
     const inputRoot = path.join(taskRoot, "input");
     const skillRoot = path.join(taskRoot, "skill");
+    const workRoot = options.skill.permissions.writableWorkDirectory ? path.join(taskRoot, "work") : undefined;
     const outputRoot = path.join(taskRoot, "output");
+    let runnerId: SkillAgentRunner["id"] = "codex";
     let result: SkillTaskResult;
     try {
       ensureNotAborted(options.signal);
       validateTaskRequest(options);
       options.onProgress({ stage: "preparing", percent: 4, message: "正在准备论文输入快照" });
-      await Promise.all([fs.mkdir(inputRoot), fs.mkdir(skillRoot), fs.mkdir(outputRoot)]);
+      await Promise.all([fs.mkdir(inputRoot), fs.mkdir(skillRoot), fs.mkdir(outputRoot), ...(workRoot ? [fs.mkdir(workRoot)] : [])]);
       const inputFiles = await copyProjectSnapshot(options.project, inputRoot, options.skill.permissions.inputPreset);
+      if (workRoot) {
+        await copyDirectoryStrict(inputRoot, workRoot, MAX_INPUT_FILES, MAX_INPUT_BYTES);
+      }
       options.onProgress({ stage: "preparing", percent: 12, message: "正在复制并核验 Skill 快照" });
       const registeredSnapshot = this.registry.snapshotPath(options.skill);
       const snapshotInspection = await this.registry.inspect(registeredSnapshot);
@@ -140,6 +153,7 @@ export class SkillTaskService {
           mustReadSkillCompletely: true,
           mayModifyInput: false,
           mayModifySkill: false,
+          mayModifyWork: Boolean(workRoot),
           mayWriteOutsideOutput: false,
           network: false
         }
@@ -154,24 +168,46 @@ export class SkillTaskService {
       ]);
 
       ensureNotAborted(options.signal);
-      const runner = this.createRunner(options.codexCommand);
-      if (runner.id !== "codex") {
+      const runner = this.createRunner(options.codexCommand, options.skill);
+      runnerId = runner.id;
+      if (runner.id !== "codex" && !(runner.id === "circletex" && options.skill.id === "tex-to-mathtype-word")) {
         throw new Error("首版 CircleTeX Skill 任务仅支持 Codex Runner。");
       }
-      options.onProgress({ stage: "running", percent: 20, message: `Codex 正在执行 ${options.skill.displayName}`, indeterminate: true });
+      const runnerLabel = runner.id === "circletex" ? "CircleTeX" : "Codex";
+      let lastRunnerPercent = 20;
+      options.onProgress({
+        stage: "running",
+        percent: lastRunnerPercent,
+        message: `${runnerLabel} 正在执行 ${options.skill.displayName}`,
+        indeterminate: runner.id === "codex"
+      });
       const agentResult = validateAgentResult(await runner.run({
         taskRoot,
         inputRoot,
         skillRoot,
         outputRoot,
+        workRoot,
         schemaPath,
         responsePath,
         skill: options.skill,
         signal: options.signal,
-        onOutput: options.onOutput
+        onOutput: options.onOutput,
+        onProgress: (progress) => {
+          const mapped = Math.round(20 + clamp(progress.percent, 0, 100) * 0.6);
+          lastRunnerPercent = Math.max(lastRunnerPercent, mapped);
+          options.onProgress({
+            stage: "running",
+            percent: lastRunnerPercent,
+            message: boundedText(progress.message, 200) || `${runnerLabel} 正在执行 ${options.skill.displayName}`,
+            detail: progress.detail,
+            elapsedSeconds: progress.elapsedSeconds,
+            estimatedRemainingSeconds: progress.estimatedRemainingSeconds,
+            metrics: progress.metrics
+          });
+        }
       }));
       ensureNotAborted(options.signal);
-      await validateTaskRoot(taskRoot);
+      await validateTaskRoot(taskRoot, Boolean(workRoot));
       const immutableAfter = await hashImmutableTaskFiles([inputRoot, skillRoot], [
         path.join(taskRoot, "task.json"),
         schemaPath
@@ -204,6 +240,7 @@ export class SkillTaskService {
         status: "completed",
         summary: agentResult.summary,
         warnings: agentResult.warnings,
+        qualityGates: agentResult.qualityGates,
         artifacts: published.artifacts,
         publishedDirectory: published.directory,
         startedAt,
@@ -227,7 +264,7 @@ export class SkillTaskService {
       await fs.rm(taskRoot, { recursive: true, force: true }).catch(() => undefined);
     }
     try {
-      await this.registry.addHistory(toHistory(result, options.skill, options.prompt.trim()));
+      await this.registry.addHistory(toHistory(result, options.skill, options.prompt.trim(), runnerId));
     } catch (error) {
       const warning = `任务结果已生成，但历史记录保存失败：${errorMessage(error)}`;
       result.warnings = [...result.warnings, warning];
@@ -235,6 +272,277 @@ export class SkillTaskService {
     }
     return result;
   }
+}
+
+export class DeterministicSkillRunner implements SkillAgentRunner {
+  public readonly id = "circletex" as const;
+
+  public constructor(
+    private readonly locateExecutable: typeof findExecutable = findExecutable,
+    private readonly executeProcess: typeof runProcess = runProcess
+  ) {}
+
+  public async run(context: SkillAgentRunContext): Promise<SkillAgentResult> {
+    if (context.skill.id !== "tex-to-mathtype-word" || !context.workRoot) {
+      throw new Error("该 Skill 不支持 CircleTeX 确定性执行器。");
+    }
+    const executable = await this.locateExecutable("pwsh");
+    if (!executable) throw new Error("未找到 PowerShell 7（pwsh），无法执行 MathType Word 导出。");
+    const script = path.join(context.skillRoot, "scripts", "export_mathtype_word.ps1");
+    const progress = new StructuredProgressDecoder(context.onProgress);
+    const result = await this.executeProcess(executable, [
+      "-NoProfile", "-STA", "-File", script,
+      "-ProjectDir", context.workRoot,
+      "-OutputDir", context.outputRoot
+    ], {
+      cwd: context.taskRoot,
+      timeoutMs: context.skill.permissions.timeoutMinutes * 60_000,
+      onOutput: (text) => {
+        context.onOutput?.(text);
+        progress.push(text);
+      },
+      signal: context.signal
+    });
+    progress.finish();
+    ensureNotAborted(context.signal);
+    if (result.timedOut) throw new Error(`MathType Word 导出超过 ${context.skill.permissions.timeoutMinutes} 分钟，已终止。`);
+    if (result.code !== 0) throw new Error(`MathType Word 导出失败，退出码 ${result.code ?? "未知"}。`);
+    const report = validateMathTypeReport(JSON.parse(
+      await fs.readFile(path.join(context.outputRoot, "conversion-report.json"), "utf8")
+    ));
+    return {
+      status: "success",
+      summary: `已生成保留版式的 MathType Word，共 ${report.layout.pageCount} 页、${report.formulaCount} 个 MathType 公式和 ${report.wordTextCount} 个普通数学文本，OMML 为 0。`,
+      artifacts: [
+        { path: "main_mathtype.docx", type: "docx", description: "保留封面、目录、分节和学校格式；明确公式为 MathType，简单数学片段为普通 Word 文本的正式 Word" },
+        { path: "conversion-report.json", type: "json", description: "公式完整性与 Word 版式结构机器校验报告" },
+        { path: "conversion-report.md", type: "markdown", description: "公式和版式转换验收摘要" }
+      ],
+      warnings: report.warnings,
+      qualityGates: reportQualityGates(report)
+    };
+  }
+}
+
+class StructuredProgressDecoder {
+  private pending = "";
+  private lastPercent = 0;
+
+  public constructor(private readonly emit?: (progress: SkillRunnerProgress) => void) {}
+
+  public push(chunk: string): void {
+    this.pending += chunk;
+    const lines = this.pending.split(/\r?\n/u);
+    this.pending = lines.pop() ?? "";
+    for (const line of lines) this.consume(line);
+  }
+
+  public finish(): void {
+    if (this.pending) this.consume(this.pending);
+    this.pending = "";
+  }
+
+  private consume(line: string): void {
+    let value: unknown;
+    try {
+      value = JSON.parse(line.replace(/^\uFEFF/u, "").trim());
+    } catch {
+      return;
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
+    const item = value as Record<string, unknown>;
+    if (item.type !== "progress" || typeof item.percent !== "number" || !Number.isFinite(item.percent)) {
+      return;
+    }
+    const message = boundedText(item.message, 200);
+    if (!message) return;
+    this.lastPercent = Math.max(this.lastPercent, clamp(item.percent, 0, 100));
+    const detail = sanitizeProgressStage(item.detail ?? (typeof item.stage === "object" ? item.stage : undefined));
+    const elapsedSeconds = boundedInteger(item.elapsedSeconds, 0, 7 * 24 * 60 * 60);
+    const estimatedRemainingSeconds = boundedInteger(item.estimatedRemainingSeconds, 0, 7 * 24 * 60 * 60);
+    const metrics = sanitizeProgressMetrics(item.metrics);
+    this.emit?.({
+      percent: this.lastPercent,
+      message,
+      ...(detail ? { detail } : {}),
+      ...(elapsedSeconds !== undefined ? { elapsedSeconds } : {}),
+      ...(estimatedRemainingSeconds !== undefined ? { estimatedRemainingSeconds } : {}),
+      ...(metrics ? { metrics } : {})
+    });
+  }
+}
+
+interface MathTypeConversionReport {
+  mathSegmentCount: number;
+  formulaCount: number;
+  wordTextCount: number;
+  uniqueFormulaCount: number;
+  payloadPassCount: number;
+  semanticVerifiedCount: number;
+  reopenStableCount: number;
+  mathTypeObjectCount: number;
+  ommlCount: number;
+  unresolvedPlaceholderCount: number;
+  formulaTextFallbackCount: number;
+  layout: {
+    pageCount: number;
+    sectionCount: number;
+    expectedSectionCount: number;
+    tableOfContentsCount: number;
+    pageBreakCount: number;
+    expectedPageBreakCount: number;
+  };
+  warnings: string[];
+}
+
+function validateMathTypeReport(value: unknown): MathTypeConversionReport {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("MathType Word 转换报告格式无效。");
+  }
+  const report = value as Record<string, unknown>;
+  const integer = (key: string): number => {
+    const candidate = report[key];
+    if (typeof candidate !== "number" || !Number.isSafeInteger(candidate) || candidate < 0) {
+      throw new Error(`MathType Word 转换报告中的 ${key} 无效。`);
+    }
+    return candidate;
+  };
+  const mathSegmentCount = integer("mathSegmentCount");
+  const formulaCount = integer("formulaCount");
+  const wordTextCount = integer("wordTextCount");
+  const uniqueFormulaCount = integer("uniqueFormulaCount");
+  const payloadPassCount = integer("payloadPassCount");
+  const semanticVerifiedCount = integer("semanticVerifiedCount");
+  const reopenStableCount = integer("reopenStableCount");
+  const mathTypeObjectCount = integer("mathTypeObjectCount");
+  const ommlCount = integer("ommlCount");
+  const unresolvedPlaceholderCount = integer("unresolvedPlaceholderCount");
+  const formulaTextFallbackCount = integer("formulaTextFallbackCount");
+  if (report.version !== 3 || !report.layoutAudit || typeof report.layoutAudit !== "object" || Array.isArray(report.layoutAudit)) {
+    throw new Error("MathType Word 转换报告缺少新版版式验收结果。");
+  }
+  const layoutAudit = report.layoutAudit as Record<string, unknown>;
+  const layoutGate = (key: string): Record<string, unknown> => {
+    const candidate = layoutAudit[key];
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate) ||
+        (candidate as Record<string, unknown>).status !== true) {
+      throw new Error(`MathType Word 未通过${key}版式门禁。`);
+    }
+    return candidate as Record<string, unknown>;
+  };
+  const count = (source: Record<string, unknown>, key: string, label: string): number => {
+    const candidate = source[key];
+    if (typeof candidate !== "number" || !Number.isSafeInteger(candidate) || candidate < 0) {
+      throw new Error(`MathType Word 转换报告中的${label}无效。`);
+    }
+    return candidate;
+  };
+  layoutGate("pageSetup");
+  const sections = layoutGate("sectionStructure");
+  layoutGate("pageNumbering");
+  const tableOfContents = layoutGate("tableOfContents");
+  layoutGate("headingCoverage");
+  const pageBreaks = layoutGate("pageBreaks");
+  const pageCount = count(layoutAudit, "pageCount", "Word 页数");
+  if (pageCount < 1) throw new Error("MathType Word 转换报告中的 Word 页数无效。");
+  if (
+    report.status !== "success" || mathSegmentCount < formulaCount || mathSegmentCount !== formulaCount + wordTextCount || formulaCount < 1 || uniqueFormulaCount < 1 ||
+    payloadPassCount !== uniqueFormulaCount || semanticVerifiedCount !== uniqueFormulaCount ||
+    reopenStableCount !== formulaCount || mathTypeObjectCount !== formulaCount ||
+    ommlCount !== 0 || unresolvedPlaceholderCount !== 0 || formulaTextFallbackCount !== 0
+  ) {
+    throw new Error("MathType Word 未通过数学片段分类、公式数量、零 OMML、零占位符和零降级门禁。");
+  }
+  const warnings = Array.isArray(report.warnings)
+    ? report.warnings.filter((item): item is string => typeof item === "string").map((item) => boundedText(item, 1000))
+    : [];
+  return {
+    mathSegmentCount,
+    formulaCount,
+    wordTextCount,
+    uniqueFormulaCount,
+    payloadPassCount,
+    semanticVerifiedCount,
+    reopenStableCount,
+    mathTypeObjectCount,
+    ommlCount,
+    unresolvedPlaceholderCount,
+    formulaTextFallbackCount,
+    layout: {
+      pageCount,
+      sectionCount: count(sections, "current", "分节数"),
+      expectedSectionCount: count(sections, "expected", "预期分节数"),
+      tableOfContentsCount: count(tableOfContents, "current", "目录数"),
+      pageBreakCount: count(pageBreaks, "current", "分页符数"),
+      expectedPageBreakCount: count(pageBreaks, "expected", "预期分页符数")
+    },
+    warnings
+  };
+}
+
+function reportQualityGates(report: MathTypeConversionReport): SkillTaskQualityGate[] {
+  return [
+    { id: "math-segments", label: "数学片段分类", status: "passed", value: `${report.mathSegmentCount}（文本 ${report.wordTextCount}）` },
+    { id: "mathtype-objects", label: "MathType 对象", status: "passed", value: `${report.mathTypeObjectCount}/${report.formulaCount}` },
+    { id: "omml", label: "OMML", status: "passed", value: String(report.ommlCount) },
+    { id: "placeholders", label: "残留占位符", status: "passed", value: String(report.unresolvedPlaceholderCount) },
+    { id: "fallbacks", label: "公式降级", status: "passed", value: String(report.formulaTextFallbackCount) },
+    { id: "reopen", label: "Word 重开校验", status: "passed", value: "通过" },
+    { id: "page-setup", label: "A4 页面与页边距", status: "passed", value: "通过" },
+    { id: "sections", label: "封面、目录与正文分节", status: "passed", value: `${report.layout.sectionCount}/${report.layout.expectedSectionCount}` },
+    { id: "page-numbering", label: "目录与正文页码", status: "passed", value: "罗马/阿拉伯" },
+    { id: "toc", label: "Word 自动目录", status: "passed", value: String(report.layout.tableOfContentsCount) },
+    { id: "headings", label: "标题结构覆盖", status: "passed", value: "通过" },
+    { id: "page-breaks", label: "LaTeX 强制分页", status: "passed", value: `${report.layout.pageBreakCount}/${report.layout.expectedPageBreakCount}` }
+  ];
+}
+
+function sanitizeProgressStage(value: unknown): SkillProgressStage | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const item = value as Record<string, unknown>;
+  const id = boundedText(item.id, 48);
+  const label = boundedText(item.label, 80);
+  if (!id || !/^[a-z0-9][a-z0-9-]*$/u.test(id) || !label ||
+      !["pending", "running", "completed", "failed"].includes(String(item.state))) {
+    return undefined;
+  }
+  const current = item.current === undefined ? undefined : boundedInteger(item.current, 0, 1_000_000_000);
+  const total = item.total === undefined ? undefined : boundedInteger(item.total, 0, 1_000_000_000);
+  if ((item.current !== undefined && current === undefined) || (item.total !== undefined && total === undefined) ||
+      (current !== undefined && total !== undefined && current > total)) {
+    return undefined;
+  }
+  const unit = item.unit === undefined ? undefined : boundedText(item.unit, 40);
+  if (item.unit !== undefined && !unit) return undefined;
+  return {
+    id,
+    label,
+    state: item.state as SkillProgressStage["state"],
+    ...(current !== undefined ? { current } : {}),
+    ...(total !== undefined ? { total } : {}),
+    ...(unit ? { unit } : {})
+  };
+}
+
+function sanitizeProgressMetrics(value: unknown): Record<string, number> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length < 1 || entries.length > 20) return undefined;
+  const result: Record<string, number> = {};
+  for (const [key, metric] of entries) {
+    if (!/^[a-z][a-zA-Z0-9]{0,39}$/u.test(key) || typeof metric !== "number" ||
+        !Number.isSafeInteger(metric) || metric < 0 || metric > 1_000_000_000_000) {
+      return undefined;
+    }
+    result[key] = metric;
+  }
+  return result;
+}
+
+function boundedInteger(value: unknown, minimum: number, maximum: number): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum && value <= maximum
+    ? value
+    : undefined;
 }
 
 async function copyProjectSnapshot(
@@ -246,7 +554,7 @@ async function copyProjectSnapshot(
     { source: project.tex, relative: "main.tex" },
     { source: project.pdf, relative: "main.pdf" }
   ];
-  if (preset === "document-resources") {
+  if (preset === "document-resources" || preset === "document-workspace") {
     const entries = await fs.readdir(project.root, { withFileTypes: true });
     for (const entry of entries) {
       if (entry.isSymbolicLink()) {
@@ -262,13 +570,23 @@ async function copyProjectSnapshot(
         sources.push({ source: path.join(project.root, entry.name), relative: entry.name });
       }
     }
+    if (preset === "document-workspace") {
+      const tex = await fs.readFile(project.tex, "utf8");
+      for (const relative of referencedProjectFiles(tex)) {
+        const source = safeJoin(project.root, relative);
+        if (await fs.stat(source).then((stat) => stat.isFile(), () => false)) {
+          sources.push({ source, relative });
+        }
+      }
+    }
   }
-  if (sources.length > MAX_INPUT_FILES) {
+  const uniqueSources = [...new Map(sources.map((item) => [item.relative.replace(/\\/g, "/"), item])).values()];
+  if (uniqueSources.length > MAX_INPUT_FILES) {
     throw new Error("论文输入快照超过 1000 个文件的限制。");
   }
   const results: Array<{ path: string; size: number; sha256: string }> = [];
   let totalBytes = 0;
-  for (const item of sources) {
+  for (const item of uniqueSources) {
     const stat = await fs.lstat(item.source);
     if (!stat.isFile() || stat.isSymbolicLink()) {
       throw new Error(`论文输入不是普通文件：${item.relative}`);
@@ -325,6 +643,9 @@ async function validateArtifacts(
     }
     if (extension === ".docx") {
       await validateDocx(file.absolutePath);
+      if (skill.id === "tex-to-mathtype-word") {
+        await validateMathTypeDocx(file.absolutePath);
+      }
     }
     results.push({
       source: file.absolutePath,
@@ -386,7 +707,7 @@ function buildSkillTaskPrompt(skill: ImportedSkill): string {
 1. 首先完整读取 skill/SKILL.md；按其中的相对引用继续读取 skill/ 内必要资源。
 2. 完整读取 task.json，按照其中的用户提示和任务范围执行。
 3. input/ 和 skill/ 是只读快照，不得修改、删除或重命名。
-4. 只允许把最终产物写入 output/；不得在任务根目录或其他目录创建业务产物。
+4. ${skill.permissions.writableWorkDirectory ? "work/ 是允许修改的隔离论文副本，可用于生成中间文件；最终产物仍必须复制到 output/。" : "只允许把最终产物写入 output/；不得在任务根目录或其他目录创建业务产物。"}
 5. 不得访问任务目录之外的文件，不得使用网络，不得请求额外权限。
 6. 只执行本任务需要的命令。导入时声明的外部命令为：${skill.permissions.declaredCommands.join("、") || "无"}。
 7. 输出类型只能是：${skill.permissions.outputExtensions.join("、")}。
@@ -445,11 +766,23 @@ function validateAgentResult(value: unknown): SkillAgentResult {
       typeof artifact.type !== "string" || artifact.type.length > 80 ||
       typeof artifact.description !== "string" || artifact.description.length > 500) ||
     !Array.isArray(result.warnings) || result.warnings.length > 100 ||
-    result.warnings.some((warning) => typeof warning !== "string" || warning.length > 1000)
+    result.warnings.some((warning) => typeof warning !== "string" || warning.length > 1000) ||
+    !validQualityGates(result.qualityGates)
   ) {
     throw new Error("Agent Skill 任务结果缺少必需字段。");
   }
   return result as unknown as SkillAgentResult;
+}
+
+function validQualityGates(value: unknown): boolean {
+  if (value === undefined) return true;
+  return Array.isArray(value) && value.length <= 12 && value.every((gate) =>
+    gate && typeof gate === "object" && !Array.isArray(gate) &&
+    /^[a-z0-9][a-z0-9-]{0,47}$/u.test(String((gate as Record<string, unknown>).id)) &&
+    boundedText((gate as Record<string, unknown>).label, 80).length > 0 &&
+    ["passed", "failed"].includes(String((gate as Record<string, unknown>).status)) &&
+    boundedText((gate as Record<string, unknown>).value, 80).length > 0
+  );
 }
 
 async function validateDocx(filePath: string): Promise<void> {
@@ -467,7 +800,39 @@ async function validateDocx(filePath: string): Promise<void> {
   }
 }
 
+async function validateMathTypeDocx(filePath: string): Promise<void> {
+  const buffer = await fs.readFile(filePath);
+  const entries = zipCentralDirectoryEntryRecords(buffer);
+  let mathTypeCount = 0;
+  for (const entry of entries) {
+    if (!entry.name.startsWith("word/") || !entry.name.endsWith(".xml")) continue;
+    const xml = inflateZipEntry(buffer, entry).toString("utf8");
+    if (/<m:oMath(?:Para)?(?:\s|>)/u.test(xml)) {
+      throw new Error("MathType Word 产物包含禁止的 OMML 公式。");
+    }
+    if (/CIRCLETEX(?:MATH|EQNUM)\d{6}/u.test(xml)) {
+      throw new Error("MathType Word 产物仍包含未替换的公式占位符。");
+    }
+    mathTypeCount += xml.split(`ProgID=\"${MATHTYPE_PROG_ID}\"`).length - 1;
+  }
+  if (mathTypeCount < 1) {
+    throw new Error("MathType Word 产物没有检测到 Equation.DSMT4 可编辑对象。");
+  }
+}
+
 function zipCentralDirectoryEntries(buffer: Buffer): Set<string> {
+  return new Set(zipCentralDirectoryEntryRecords(buffer).map((entry) => entry.name));
+}
+
+interface ZipEntryRecord {
+  name: string;
+  method: number;
+  compressedSize: number;
+  uncompressedSize: number;
+  localOffset: number;
+}
+
+function zipCentralDirectoryEntryRecords(buffer: Buffer): ZipEntryRecord[] {
   const minimum = Math.max(0, buffer.length - 65_557);
   let endOffset = -1;
   for (let offset = buffer.length - 22; offset >= minimum; offset -= 1) {
@@ -485,7 +850,7 @@ function zipCentralDirectoryEntries(buffer: Buffer): Set<string> {
   if (entryCount > 10_000 || directoryOffset + directorySize > endOffset) {
     throw new Error("DOCX 产物的 ZIP 中央目录无效。");
   }
-  const entries = new Set<string>();
+  const entries: ZipEntryRecord[] = [];
   let offset = directoryOffset;
   for (let index = 0; index < entryCount; index += 1) {
     if (offset + 46 > buffer.length || buffer.readUInt32LE(offset) !== 0x02014b50) {
@@ -499,10 +864,34 @@ function zipCentralDirectoryEntries(buffer: Buffer): Set<string> {
     if (nameEnd > buffer.length) {
       throw new Error("DOCX 产物的 ZIP 条目名称无效。");
     }
-    entries.add(buffer.subarray(nameStart, nameEnd).toString("utf8").replace(/\\/g, "/"));
+    entries.push({
+      name: buffer.subarray(nameStart, nameEnd).toString("utf8").replace(/\\/g, "/"),
+      method: buffer.readUInt16LE(offset + 10),
+      compressedSize: buffer.readUInt32LE(offset + 20),
+      uncompressedSize: buffer.readUInt32LE(offset + 24),
+      localOffset: buffer.readUInt32LE(offset + 42)
+    });
     offset = nameEnd + extraLength + commentLength;
   }
   return entries;
+}
+
+function inflateZipEntry(buffer: Buffer, entry: ZipEntryRecord): Buffer {
+  const offset = entry.localOffset;
+  if (offset + 30 > buffer.length || buffer.readUInt32LE(offset) !== 0x04034b50) {
+    throw new Error("DOCX 产物的 ZIP 本地条目无效。");
+  }
+  const nameLength = buffer.readUInt16LE(offset + 26);
+  const extraLength = buffer.readUInt16LE(offset + 28);
+  const dataStart = offset + 30 + nameLength + extraLength;
+  const dataEnd = dataStart + entry.compressedSize;
+  if (dataEnd > buffer.length) throw new Error("DOCX 产物的 ZIP 数据越界。");
+  const data = buffer.subarray(dataStart, dataEnd);
+  if (entry.method === 0) return data;
+  if (entry.method !== 8) throw new Error("DOCX 产物包含不支持的 ZIP 压缩方法。");
+  const inflated = inflateRawSync(Uint8Array.from(data));
+  if (inflated.length !== entry.uncompressedSize) throw new Error("DOCX 产物的 ZIP 解压长度异常。");
+  return inflated;
 }
 
 async function copyDirectoryStrict(source: string, target: string, maxFiles: number, maxBytes: number): Promise<void> {
@@ -571,8 +960,9 @@ async function hashImmutableTaskFiles(roots: readonly string[], files: readonly 
   return hash.digest("hex");
 }
 
-async function validateTaskRoot(taskRoot: string): Promise<void> {
+async function validateTaskRoot(taskRoot: string, allowWork: boolean): Promise<void> {
   const allowed = new Set(["input", "skill", "output", "task.json", "result-schema.json", "agent-result.json"]);
+  if (allowWork) allowed.add("work");
   const entries = await fs.readdir(taskRoot, { withFileTypes: true });
   for (const entry of entries) {
     if (!allowed.has(entry.name)) {
@@ -582,6 +972,31 @@ async function validateTaskRoot(taskRoot: string): Promise<void> {
       throw new Error(`任务根目录包含不允许的符号链接或重解析点：${entry.name}`);
     }
   }
+}
+
+function referencedProjectFiles(tex: string): string[] {
+  const files = new Set<string>();
+  const patterns = [
+    /\\includegraphics(?:\[[^\]]*\])?\{([^{}]+)\}/gu,
+    /\\(?:input|include)\{([^{}]+)\}/gu,
+    /\\(?:bibliography|addbibresource)(?:\[[^\]]*\])?\{([^{}]+)\}/gu
+  ];
+  for (const pattern of patterns) {
+    for (const match of tex.matchAll(pattern)) {
+      const value = match[1].trim().replace(/\\/g, "/");
+      if (!value || value.includes("\0") || path.posix.isAbsolute(value) || /^[A-Za-z]:\//.test(value)) continue;
+      const candidates = pattern.source.includes("includegraphics") && !path.posix.extname(value)
+        ? [".png", ".jpg", ".jpeg", ".pdf", ".svg", ".eps"].map((extension) => `${value}${extension}`)
+        : [value];
+      for (const candidate of candidates) {
+        const normalized = path.posix.normalize(candidate);
+        if (normalized !== candidate || candidate.startsWith("../")) continue;
+        files.add(normalized);
+        if (!candidate.startsWith("figures/")) files.add(path.posix.join("figures", normalized));
+      }
+    }
+  }
+  return [...files];
 }
 
 function selectionManifest(selection: PdfSelection): object {
@@ -651,15 +1066,24 @@ function boundedText(value: unknown, maximum: number): string {
   return typeof value === "string" && value.length <= maximum ? value.trim() : "";
 }
 
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function toHistory(result: SkillTaskResult, skill: ImportedSkill, prompt: string): SkillTaskHistoryEntry {
+function toHistory(
+  result: SkillTaskResult,
+  skill: ImportedSkill,
+  prompt: string,
+  agent: SkillAgentRunner["id"]
+): SkillTaskHistoryEntry {
   return {
     ...result,
     artifacts: result.artifacts.map((artifact) => ({ ...artifact })),
-    agent: "codex",
+    agent,
     skillHash: skill.hash,
     prompt
   };

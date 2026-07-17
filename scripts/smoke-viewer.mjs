@@ -25,7 +25,7 @@ assert.equal(visibleTextLength("ﬁ"), 2, "NFKC 展开的字素必须按规范�
 const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/media/viewer.css"></head><body>
 <header class="toolbar"><button id="previous-page" class="icon-button">‹</button><label class="page-control"><input id="page-number" type="number" min="1" value="1"><span id="page-count">/ …</span></label><button id="next-page" class="icon-button">›</button><span class="separator"></span><button id="zoom-out" class="icon-button">−</button><span id="zoom-value" class="zoom-value">125%</span><button id="zoom-in" class="icon-button">＋</button><button id="fit-width" class="toolbar-button">适合宽度</button><span class="separator"></span><button id="region-select" class="icon-button tool-toggle" aria-pressed="false"><span class="region-select-icon"></span></button><button id="clear-selection" class="icon-button" disabled>×</button><span class="toolbar-spacer"></span><button id="compile" class="toolbar-button">编译</button></header>
 <main class="layout">
-  <section id="viewer" class="viewer"><div id="loading" class="loading">正在载入 main.pdf……</div><div id="pages" class="pages"></div></section>
+  <section id="viewer" class="viewer"><div id="loading" class="loading"><div class="loading-meta"><span id="loading-label">正在初始化 PDF 审阅……</span><span id="loading-value">0%</span></div><div id="loading-track" class="loading-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="loading-fill" class="loading-fill"></div></div></div><div id="pages" class="pages"></div></section>
   <section class="revision-dock">
     <div class="detail-bands">
       <details id="selection-details" class="detail-band" hidden><summary><span>PDF 选区</span><span id="selection-summary" class="detail-summary"></span></summary><div class="detail-content"><pre id="selection-text"></pre></div></details>
@@ -37,6 +37,7 @@ const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><met
       <div class="manual-edit-history"><span id="pending-edit-count">0 项待提交</span><button id="manual-undo" class="icon-button" disabled>↶</button><button id="manual-clear" class="icon-button" disabled>×</button><button id="manual-accept-all" class="secondary-button" hidden>接受全部</button><button id="manual-reject-all" class="secondary-button" hidden>拒绝全部</button></div>
     </div>
     <div class="prompt-bar"><div class="task-selector-row"><label for="task-mode">任务</label><select id="task-mode"><option value="revision">局部修订</option></select><span id="task-scope-note">需要 PDF 选区</span></div><div class="analysis-row"><textarea id="instruction" maxlength="4000" disabled></textarea><button id="analyze" class="primary-button" disabled>交给 AI 助手分析</button></div><div class="prompt-actions"><button id="manual-handoff" class="secondary-button" hidden>复制任务并打开 AI 助手</button><div id="candidate-actions" class="candidate-actions" hidden><button id="show-diff" class="secondary-button">查看差异</button><button id="apply" class="primary-button">应用并保存</button><button id="discard" class="secondary-button">放弃</button></div></div></div>
+    <section id="skill-progress" class="skill-progress" hidden aria-live="polite" aria-label="Skill 任务进度"><div class="skill-progress-header"><div class="skill-progress-identity"><strong id="skill-progress-name">Skill 任务</strong><span id="skill-progress-state" class="skill-progress-state" data-state="pending">等待</span></div><div class="skill-progress-meta"><span id="skill-progress-elapsed">00:00</span><span id="skill-progress-value">0%</span></div></div><div id="skill-progress-track" class="skill-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="skill-progress-fill" class="skill-progress-fill"></div></div><ol id="skill-progress-stages" class="skill-progress-stages"></ol><div id="skill-progress-message" class="skill-progress-message"></div><details id="skill-progress-details" class="skill-progress-details"><summary>详细信息</summary><div id="skill-progress-events" class="skill-progress-events"></div></details><div id="skill-quality-gates" class="skill-quality-gates" hidden><div class="skill-quality-title">质量门禁</div><div id="skill-quality-list" class="skill-quality-list"></div></div></section>
     <div id="skill-artifacts" class="skill-artifacts" hidden></div>
     <div id="compile-progress" class="compile-progress" hidden><div class="compile-progress-meta"><span id="compile-progress-label">准备编译</span><span id="compile-progress-value">0%</span></div><div id="compile-progress-track" class="compile-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="compile-progress-fill" class="compile-progress-fill"></div></div></div>
     <div class="status-line"><span id="candidate-summary" hidden></span><span id="status"></span></div>
@@ -336,6 +337,7 @@ try {
     const total = Number(document.getElementById("page-count")?.textContent?.match(/\d+/)?.[0]);
     return total >= 2 && document.querySelectorAll(".pdf-page").length === total;
   });
+  assert.ok(Number(await page.locator("#loading-track").getAttribute("aria-valuenow")) >= 75);
   await page.waitForFunction(() => document.querySelectorAll(".pdf-page canvas").length >= 1);
   await page.waitForFunction(() => document.querySelector('.pdf-page[data-render-stage="text"]'));
   await page.waitForFunction(() => window.__startupPreviewEvents.some((event) => event.type === "snapshotRemoved"));
@@ -412,14 +414,86 @@ try {
   await page.evaluate(() => window.dispatchEvent(new MessageEvent("message", {
     data: {
       type: "skillsChanged",
-      skills: [{ id: "paper-export", name: "论文导出", scope: "document", taskType: "artifact" }]
+      skills: [{ id: "tex-to-mathtype-word", name: "无底稿 MathType Word 导出", scope: "document", taskType: "artifact" }]
     }
   })));
-  await page.locator("#task-mode").selectOption("skill:paper-export");
+  await page.locator("#task-mode").selectOption("skill:tex-to-mathtype-word");
   await page.locator("#instruction").fill("生成论文导出产物");
   assert.equal(await page.locator("#task-scope-note").textContent(), "整篇论文");
   assert.equal(await page.locator("#analyze").textContent(), "交给 Snow CLI 执行");
   assert.equal(await page.locator("#analyze").isEnabled(), true);
+  await page.evaluate(() => window.dispatchEvent(new MessageEvent("message", { data: {
+    type: "skillTaskStarted",
+    skillId: "tex-to-mathtype-word",
+    skillName: "无底稿 MathType Word 导出",
+    message: "正在准备 Word 导出任务"
+  } })));
+  assert.equal(await page.locator("#skill-progress").isHidden(), false);
+  assert.equal(await page.locator("#skill-progress-name").textContent(), "无底稿 MathType Word 导出");
+  assert.equal(await page.locator("#skill-progress-state").textContent(), "运行");
+  assert.equal(await page.locator("#skill-progress-stages > li").count(), 8);
+  assert.ok(await page.locator('#skill-progress-stages > li[data-state="pending"]').count() > 0);
+  assert.equal(await page.locator("#compile-progress").isHidden(), true);
+  await page.evaluate(() => window.dispatchEvent(new MessageEvent("message", { data: {
+    type: "skillTaskProgress",
+    stage: "running",
+    percent: 24,
+    message: "正在执行旧格式 Skill 进度",
+    indeterminate: true
+  } })));
+  assert.equal(await page.locator("#skill-progress-value").textContent(), "24%");
+  assert.equal(await page.locator("#skill-progress").evaluate((element) => element.classList.contains("is-indeterminate")), true);
+  await page.evaluate(() => window.dispatchEvent(new MessageEvent("message", { data: {
+    type: "skillTaskProgress",
+    stage: "running",
+    percent: 42,
+    message: "正在解析论文公式",
+    detail: { id: "parse-formulas", label: "解析公式", state: "running", current: 138, total: 278, unit: "个不同公式" }
+  } })));
+  assert.equal(await page.locator('#skill-progress-stages > li[data-state="running"] .skill-stage-count').textContent(), "138/278 个不同公式");
+  await page.evaluate(() => window.dispatchEvent(new MessageEvent("message", { data: {
+    type: "skillTaskFailed",
+    message: "测试 Skill 失败"
+  } })));
+  assert.equal(await page.locator("#skill-progress").getAttribute("data-state"), "failed");
+  assert.equal(await page.locator("#skill-progress-message").textContent(), "测试 Skill 失败");
+  assert.equal(await page.locator("#skill-progress").isHidden(), false);
+  await page.evaluate(() => {
+    window.dispatchEvent(new MessageEvent("message", { data: {
+      type: "skillTaskStarted",
+      skillId: "tex-to-mathtype-word",
+      skillName: "无底稿 MathType Word 导出",
+      message: "正在重新执行 Word 导出任务"
+    } }));
+    window.dispatchEvent(new MessageEvent("message", { data: {
+      type: "skillTaskProgress",
+      stage: "running",
+      percent: 68,
+      message: "正在回填 MathType 可编辑对象",
+      detail: { id: "assemble-formulas", label: "装配公式", state: "running", current: 325, total: 477, unit: "个公式位置" }
+    } }));
+    window.dispatchEvent(new MessageEvent("message", { data: {
+      type: "skillTaskCompleted",
+      summary: "Word 导出完成",
+      warnings: [],
+      artifacts: [],
+      qualityGates: [
+        { id: "mathtype-objects", label: "MathType 对象", status: "passed", value: "477/477" },
+        { id: "omml", label: "OMML", status: "passed", value: "0" },
+        { id: "placeholders", label: "残留占位符", status: "passed", value: "0" },
+        { id: "fallbacks", label: "公式降级", status: "passed", value: "0" },
+        { id: "reopen", label: "Word 重开校验", status: "passed", value: "通过" }
+      ]
+    } }));
+  });
+  assert.equal(await page.locator("#skill-progress-value").textContent(), "100%");
+  assert.equal(await page.locator("#skill-progress-state").textContent(), "完成");
+  assert.equal(await page.locator('#skill-progress-stages > li[data-state="completed"]').count(), 8);
+  assert.equal(await page.locator("#skill-quality-list .skill-quality-item").count(), 5);
+  assert.equal(await page.locator("#skill-quality-gates").isHidden(), false);
+  await page.locator("#skill-progress-details > summary").click();
+  assert.ok(await page.locator("#skill-progress-events .skill-progress-event").count() >= 2);
+  await page.locator("#skill-progress-details > summary").click();
   await page.locator("#instruction").fill("");
   await page.locator("#task-mode").selectOption("revision");
   await page.evaluate(() => {
@@ -837,13 +911,35 @@ try {
     return rect.bottom > viewerRect.top && rect.top < viewerRect.bottom &&
       pageElement.querySelector(".page-placeholder").hidden;
   }, undefined, { timeout: 15_000 });
+  await page.locator('.pdf-page[data-page-number="6"]').evaluate((pageElement) => {
+    pageElement.scrollIntoView({ block: "center" });
+  });
+  await page.waitForFunction(() => {
+    const pageElement = document.querySelector('.pdf-page[data-page-number="6"]');
+    const viewerRect = document.getElementById("viewer").getBoundingClientRect();
+    const rect = pageElement.getBoundingClientRect();
+    const viewerCenter = (viewerRect.top + viewerRect.bottom) / 2;
+    return rect.top < viewerCenter && rect.bottom > viewerCenter;
+  });
 
   const selectionCountBeforeRegion = await page.evaluate(() => window.__messages.filter((message) => message.type === "selection").length);
   await page.locator("#region-select").click();
   assert.equal(await page.locator("#region-select").getAttribute("aria-pressed"), "true");
   const regionBox = await findVisibleTextBox(page);
   await dragRegion(page, regionBox);
-  await page.waitForFunction((count) => window.__messages.filter((message) => message.type === "selection").length > count, selectionCountBeforeRegion);
+  await page.waitForFunction(
+    (count) => window.__messages.filter((message) => message.type === "selection").length > count,
+    selectionCountBeforeRegion,
+    { timeout: 10_000 }
+  ).catch(async (error) => {
+    const diagnostic = await page.evaluate(() => ({
+      status: document.getElementById("status").textContent,
+      selectionTool: document.getElementById("viewer").dataset.selectionTool,
+      drafts: document.querySelectorAll(".region-selection-draft").length,
+      overlays: document.querySelectorAll(".region-selection-overlay").length
+    }));
+    throw new Error(`区域框选未产生选择消息：${JSON.stringify(diagnostic)}`, { cause: error });
+  });
   const regionMessage = await page.evaluate(() => window.__messages.findLast((message) => message.type === "selection"));
   assert.equal(regionMessage.selectionKind, "region");
   assert.equal(regionMessage.page, regionBox.page);
@@ -1389,6 +1485,23 @@ try {
     return { left: rect.left, right: rect.right, viewportWidth: innerWidth };
   });
   assert.ok(narrowProgress.left >= 0 && narrowProgress.right <= narrowProgress.viewportWidth);
+  const narrowSkillLayout = await page.locator("#skill-progress").evaluate((panel) => {
+    panel.scrollIntoView({ block: "nearest" });
+    const panelRect = panel.getBoundingClientRect();
+    const stages = [...panel.querySelectorAll(".skill-progress-stage")].map((item) => {
+      const rect = item.getBoundingClientRect();
+      return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
+    });
+    const gates = [...panel.querySelectorAll(".skill-quality-item")].map((item) => {
+      const rect = item.getBoundingClientRect();
+      return { left: rect.left, right: rect.right };
+    });
+    return { panel: { left: panelRect.left, right: panelRect.right }, stages, gates, viewportWidth: innerWidth };
+  });
+  assert.ok(narrowSkillLayout.panel.left >= 0 && narrowSkillLayout.panel.right <= narrowSkillLayout.viewportWidth);
+  assert.ok(narrowSkillLayout.stages.every((item) => item.left >= narrowSkillLayout.panel.left && item.right <= narrowSkillLayout.panel.right));
+  assert.ok(narrowSkillLayout.stages.slice(1).every((item, index) => item.top >= narrowSkillLayout.stages[index].bottom - 1));
+  assert.ok(narrowSkillLayout.gates.every((item) => item.left >= narrowSkillLayout.panel.left && item.right <= narrowSkillLayout.panel.right));
   await page.locator("#mode-agent").click();
   const narrowAnalysisLayout = await page.locator(".analysis-row").evaluate((row) => {
     const input = row.querySelector("#instruction").getBoundingClientRect();

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "taskType": "artifact",
+  "scope": "document",
+  "inputPreset": "document-workspace",
+  "writableWorkDirectory": true,
+  "agentIndependent": true,
+  "outputExtensions": [".docx", ".json", ".md"],
+  "declaredCommands": ["python", "pandoc", "pwsh", "winword", "mathtype", "pdfinfo"],
+  "network": false,
+  "supportedAgents": ["codex"],
+  "timeoutMinutes": 240
+}

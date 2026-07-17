@@ -73,6 +73,7 @@ const ADDED_COMMAND = "\\CircleTeXAdded";
 const DELETED_COMMAND = "\\CircleTeXDeleted";
 const SOURCE_FORBIDDEN = /[\\{}$%&#_^~]/u;
 const UNSAFE_TEXT_CONTROLS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u202A-\u202E\u2066-\u2069]/u;
+const TRANSPARENT_LAYOUT_COMMAND_RE = /\\(?:hspace|vspace)\*?\{[^{}]*\}|\\(?:noindent|par|quad|qquad|enspace|thinspace|medspace|thickspace|smallskip|medskip|bigskip|newline|linebreak)\b/gu;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter("und", { granularity: "grapheme" });
 class ManualEditCharacterMatchError extends Error {
   public constructor() {
@@ -897,7 +898,8 @@ function validateOrdinarySourceFragment(windowText: string, localStart: number, 
   if (fragment.length === 0 || collapseVisibleText(fragment).text.length === 0) {
     throw new Error("手动修订目标不包含普通正文。");
   }
-  if (SOURCE_FORBIDDEN.test(fragment) || UNSAFE_TEXT_CONTROLS.test(fragment)) {
+  const withoutLayout = fragment.replace(TRANSPARENT_LAYOUT_COMMAND_RE, "");
+  if (SOURCE_FORBIDDEN.test(withoutLayout) || UNSAFE_TEXT_CONTROLS.test(fragment)) {
     throw new Error("手动修订目标包含 LaTeX 命令、数学或对齐控制字符。");
   }
   if (
@@ -908,10 +910,15 @@ function validateOrdinarySourceFragment(windowText: string, localStart: number, 
   }
   if (
     isInsideControlSequence(windowText, localStart) ||
-    !isEditableLatexTextRange(windowText, localStart, localStart + fragment.length)
+    !isEditableLatexTextRange(windowText, localStart, localStart + fragment.length) &&
+    !(withoutLayout !== fragment && isLayoutOnlyEditableFragment(withoutLayout))
   ) {
     throw new Error("手动修订目标位于 LaTeX 命令、注释或数学环境中。");
   }
+}
+
+function isLayoutOnlyEditableFragment(value: string): boolean {
+  return value.length > 0 && !SOURCE_FORBIDDEN.test(value) && !UNSAFE_TEXT_CONTROLS.test(value);
 }
 
 function isInsideControlSequence(source: string, start: number): boolean {

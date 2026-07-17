@@ -52,7 +52,7 @@ export class SyncTexLocator {
     }
 
     const locations = selectionLocations(selection);
-    const records = await mapWithConcurrency(locations, 4, (location) =>
+    const records = await mapWithConcurrency(locations, 3, (location) =>
       this.locatePoint(executable, project, location.page, location.point)
     );
     const mainPath = normalizePath(project.tex, project.root);
@@ -250,10 +250,11 @@ export class SyncTexLocator {
 
 export function selectionLocations(selection: PdfSelection): Array<{ page: number; point: PdfPoint }> {
   if (selection.kind === "region") {
-    return uniqueLocations([selection.start, ...selection.anchors, selection.end].map((point) => ({
+    const locations = uniqueLocations([selection.start, ...selection.anchors, selection.end].map((point) => ({
       page: selection.page,
       point
     })));
+    return evenlySampleLocations(locations, 6);
   }
   if (selection.pageFragments?.length) {
     return uniqueLocations(selection.pageFragments.flatMap((fragment) => [
@@ -262,6 +263,19 @@ export function selectionLocations(selection: PdfSelection): Array<{ page: numbe
     ]));
   }
   return uniqueLocations([selection.start, selection.end].map((point) => ({ page: selection.page, point })));
+}
+
+function evenlySampleLocations<T>(items: readonly T[], maximum: number): T[] {
+  if (items.length <= maximum) return [...items];
+  const selected: T[] = [];
+  const indexes = new Set<number>();
+  for (let index = 0; index < maximum; index += 1) {
+    indexes.add(Math.round(index * (items.length - 1) / (maximum - 1)));
+  }
+  for (const index of [...indexes].sort((left, right) => left - right)) {
+    selected.push(items[index]);
+  }
+  return selected;
 }
 
 function uniqueLocations(

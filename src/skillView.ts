@@ -86,7 +86,8 @@ export async function configureAndConfirmSkill(
     "CircleTeX 只会复制所选输入，不会向 Agent 暴露真实论文目录。",
     [
       { value: "document", label: "正文与 PDF", detail: "只复制 main.tex 和 main.pdf" },
-      { value: "document-resources", label: "正文、PDF 与资源", detail: "再复制 figures 及根目录中的参考文献、样式和图片" }
+      { value: "document-resources", label: "正文、PDF 与资源", detail: "再复制 figures 及根目录中的参考文献、样式和图片" },
+      { value: "document-workspace", label: "完整论文工作副本", detail: "复制正文、PDF、样式及 main.tex 实际引用的图片，允许在隔离 work 目录生成中间文件" }
     ],
     previous?.inputPreset
   );
@@ -116,12 +117,12 @@ export async function configureAndConfirmSkill(
 
   const timeoutText = await vscode.window.showInputBox({
     title: "CircleTeX：设置任务超时",
-    prompt: "输入 1 至 60 分钟。",
+    prompt: "输入 1 至 240 分钟。",
     value: String(previous?.timeoutMinutes ?? 15),
     ignoreFocusOut: true,
     validateInput: (value) => {
       const parsed = Number(value);
-      return Number.isInteger(parsed) && parsed >= 1 && parsed <= 60 ? undefined : "请输入 1 至 60 之间的整数。";
+      return Number.isInteger(parsed) && parsed >= 1 && parsed <= 240 ? undefined : "请输入 1 至 240 之间的整数。";
     }
   });
   if (timeoutText === undefined) return undefined;
@@ -134,7 +135,9 @@ export async function configureAndConfirmSkill(
     declaredCommands,
     network: false,
     supportedAgents: ["codex"],
-    timeoutMinutes: Number(timeoutText)
+    timeoutMinutes: Number(timeoutText),
+    writableWorkDirectory: inputPreset === "document-workspace",
+    agentIndependent: false
   };
   const changed = replacing && (replacing.hash !== inspection.hash || !samePermissions(replacing.permissions, permissions));
   const action = await vscode.window.showWarningMessage(
@@ -166,6 +169,8 @@ export function showSkillDetails(skill: ImportedSkill): Thenable<string | undefi
         "网络：禁止",
         "Agent：仅 Codex",
         `超时：${skill.permissions.timeoutMinutes} 分钟`,
+        `隔离工作副本：${skill.permissions.writableWorkDirectory ? "允许" : "不允许"}`,
+        `执行方式：${skill.permissions.agentIndependent ? "CircleTeX 确定性执行" : "Agent 执行"}`,
         `Skill 文件：${skill.inspection.fileCount} 个，${formatBytes(skill.inspection.totalBytes)}`,
         `内容哈希：${skill.hash}`,
         `来源：${skill.sourcePath}`
@@ -228,6 +233,8 @@ function permissionSummary(
     "网络访问：禁止",
     "支持 Agent：仅 Codex",
     `超时：${permissions.timeoutMinutes} 分钟`,
+    `隔离工作副本：${permissions.writableWorkDirectory ? "允许" : "不允许"}`,
+    `执行方式：${permissions.agentIndependent ? "CircleTeX 确定性执行" : "Agent 执行"}`,
     `文件：${inspection.fileCount} 个，${formatBytes(inspection.totalBytes)}`,
     `脚本：${inspection.scriptFiles.join("、") || "无"}`,
     "",
@@ -300,7 +307,8 @@ function scopeLabel(value: SkillScope): string {
 }
 
 function inputPresetLabel(value: SkillInputPreset): string {
-  return value === "document" ? "main.tex 与 main.pdf" : "正文、PDF 与论文资源";
+  if (value === "document") return "main.tex 与 main.pdf";
+  return value === "document-workspace" ? "完整论文工作副本" : "正文、PDF 与论文资源";
 }
 
 function statusLabel(value: SkillTaskHistoryEntry["status"]): string {

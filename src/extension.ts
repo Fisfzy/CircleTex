@@ -9,7 +9,8 @@ import { chooseProjectRoot, isFile, projectPaths, resolveProject } from "./proje
 import { ReviewPanel } from "./reviewPanel";
 import { CircleTexSettingsProvider } from "./settingsView";
 import { SkillRegistry } from "./skillRegistry";
-import { SkillTaskService } from "./skillTask";
+import { readSkillPermissionManifest } from "./skillManifest";
+import { CodexSkillRunner, DeterministicSkillRunner, SkillTaskService } from "./skillTask";
 import {
   chooseSkillDirectory,
   CircleTexSkillProvider,
@@ -31,12 +32,18 @@ export function activate(context: vscode.ExtensionContext): void {
   const startProvider = new CircleTexStartProvider();
   const settingsProvider = new CircleTexSettingsProvider();
   const skillRegistry = new SkillRegistry(path.join(context.globalStorageUri.fsPath, "skill-registry"));
-  const skillTaskService = new SkillTaskService(skillRegistry);
+  const skillTaskService = new SkillTaskService(
+    skillRegistry,
+    (command, skill) => skill.id === "tex-to-mathtype-word"
+      ? new DeterministicSkillRunner()
+      : new CodexSkillRunner(command)
+  );
   const skillProvider = new CircleTexSkillProvider(skillRegistry);
   let activePanel: ReviewPanel | undefined;
   let skillInitializationError: unknown;
   const skillReady = skillRegistry.initialize().then(
-    () => {
+    async () => {
+      await installBundledSkills(context, skillRegistry, output);
       skillProvider.refresh();
       activePanel?.updateSkills();
     },
@@ -405,3 +412,30 @@ async function compileWithoutPanel(
 }
 
 export function deactivate(): void {}
+
+async function installBundledSkills(
+  context: vscode.ExtensionContext,
+  registry: SkillRegistry,
+  output: vscode.OutputChannel
+): Promise<void> {
+  const root = vscode.Uri.joinPath(context.extensionUri, "bundled-skills").fsPath;
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await import("node:fs/promises").then((fs) => fs.readdir(root, { withFileTypes: true }));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const source = path.join(root, entry.name);
+    const permissions = await readSkillPermissionManifest(source);
+    if (!permissions) continue;
+    const inspection = await registry.inspect(source);
+    const existing = registry.get(inspection.id);
+    if (!existing || existing.hash !== inspection.hash || JSON.stringify(existing.permissions) !== JSON.stringify(permissions)) {
+      await registry.import(inspection, permissions);
+      output.appendLine(`[Skill] 已安装内置 Skill：${inspection.displayName}`);
+    }
+  }
+}

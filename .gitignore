@@ -12,7 +12,12 @@ circletex-0.5.*.vsix
 circletex-0.6.*.vsix
 circletex-0.7.*.vsix
 circletex-0.8.*.vsix
-circletex-0.9.0.vsix
+circletex-0.9.*.vsix
+circletex-0.10.0.vsix
+circletex-0.10.1.vsix
+circletex-0.10.2.vsix
+circletex-0.10.3.vsix
+circletex-0.10.4.vsix
 
 # Internal artifacts
 artifacts/
@@ -22,6 +27,9 @@ artifacts/
 
 # Snow / agent runtime
 .snow/
+
+# Python cache
+__pycache__/
 
 # OS junk
 Thumbs.db

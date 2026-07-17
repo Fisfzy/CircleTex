@@ -1,0 +1,4 @@
+interface:
+  display_name: "保留版式的 MathType Word 导出"
+  short_description: "从 main.tex 重建论文版式并生成全 MathType 公式的 DOCX"
+  default_prompt: "使用 $tex-to-mathtype-word 从当前论文生成保留封面、目录、分节和学校格式的正式 Word，全部公式必须是 MathType 对象。"

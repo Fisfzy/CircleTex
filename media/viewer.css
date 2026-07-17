@@ -175,7 +175,7 @@ button:disabled { opacity: 0.45; cursor: default; }
   position: sticky;
   z-index: 8;
   top: 12px;
-  width: max-content;
+  width: min(420px, calc(100% - 32px));
   max-width: calc(100% - 32px);
   margin: 12px auto -42px;
   padding: 7px 12px;
@@ -220,6 +220,40 @@ button:disabled { opacity: 0.45; cursor: default; }
   padding: 24px;
   background: var(--vscode-sideBar-background);
   pointer-events: none;
+}
+
+.loading-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  font-size: 12px;
+}
+
+.loading-track {
+  height: 3px;
+  margin-top: 6px;
+  overflow: hidden;
+  background: var(--vscode-progressBar-background, rgb(127 127 127 / 0.25));
+  border-radius: 999px;
+}
+
+.loading-fill {
+  width: 0;
+  height: 100%;
+  background: var(--vscode-button-background);
+  border-radius: inherit;
+  transition: width 140ms ease-out;
+}
+
+.loading.is-indeterminate .loading-fill {
+  width: 35% !important;
+  animation: loading-progress-indeterminate 1.1s ease-in-out infinite;
+}
+
+@keyframes loading-progress-indeterminate {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(310%); }
 }
 .startup-preview-overlay img {
   width: auto;
@@ -732,6 +766,100 @@ pre {
   gap: 6px;
 }
 .candidate-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; max-width: 310px; }
+.skill-progress {
+  display: grid;
+  gap: 8px;
+  padding: 9px 12px 10px;
+  color: var(--vscode-descriptionForeground);
+  border-top: 1px solid var(--vscode-panel-border, transparent);
+  border-bottom: 1px solid var(--vscode-panel-border, transparent);
+  font-size: 12px;
+}
+.skill-progress-header,
+.skill-progress-identity,
+.skill-progress-meta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+.skill-progress-header { justify-content: space-between; gap: 12px; }
+.skill-progress-identity { gap: 8px; }
+.skill-progress-identity strong { min-width: 0; color: var(--vscode-foreground); overflow-wrap: anywhere; }
+.skill-progress-meta { flex: none; gap: 12px; font-variant-numeric: tabular-nums; }
+.skill-progress-state { color: var(--vscode-descriptionForeground); }
+.skill-progress-state[data-state="running"] { color: var(--vscode-progressBar-background); }
+.skill-progress-state[data-state="completed"] { color: var(--vscode-testing-iconPassed, #2ea043); }
+.skill-progress-state[data-state="failed"] { color: var(--vscode-errorForeground); }
+.skill-progress-track {
+  position: relative;
+  height: 5px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--vscode-progressBar-background, #0e70c0) 20%, transparent);
+  border-radius: 2px;
+}
+.skill-progress-fill {
+  height: 100%;
+  background: var(--vscode-progressBar-background, #0e70c0);
+  border-radius: inherit;
+  transition: width 180ms ease;
+}
+.skill-progress.is-indeterminate .skill-progress-fill {
+  position: relative;
+  min-width: 18%;
+  overflow: hidden;
+}
+.skill-progress.is-indeterminate .skill-progress-fill::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.62), transparent);
+  animation: compile-progress-pulse 1.15s linear infinite;
+}
+.skill-progress[data-state="completed"] .skill-progress-fill { background: var(--vscode-testing-iconPassed, #2ea043); }
+.skill-progress[data-state="failed"] .skill-progress-fill { background: var(--vscode-errorForeground); }
+.skill-progress-stages {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--vscode-panel-border, transparent);
+}
+.skill-progress-stage {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 6px;
+  padding: 7px 8px 5px 0;
+}
+.skill-progress-stage + .skill-progress-stage { padding-left: 8px; border-left: 1px solid var(--vscode-panel-border, transparent); }
+.skill-stage-status { min-width: 24px; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.5; }
+.skill-progress-stage[data-state="running"] .skill-stage-status,
+.skill-progress-stage[data-state="running"] .skill-stage-label { color: var(--vscode-progressBar-background); }
+.skill-progress-stage[data-state="completed"] .skill-stage-status { color: var(--vscode-testing-iconPassed, #2ea043); }
+.skill-progress-stage[data-state="failed"] .skill-stage-status,
+.skill-progress-stage[data-state="failed"] .skill-stage-label { color: var(--vscode-errorForeground); }
+.skill-stage-content { min-width: 0; display: grid; gap: 2px; }
+.skill-stage-label,
+.skill-stage-count { min-width: 0; overflow-wrap: anywhere; }
+.skill-stage-label { color: var(--vscode-foreground); line-height: 1.35; }
+.skill-stage-count { font-variant-numeric: tabular-nums; }
+.skill-progress-message { min-width: 0; overflow-wrap: anywhere; line-height: 1.4; }
+.skill-progress-details summary { width: max-content; max-width: 100%; cursor: pointer; color: var(--vscode-foreground); }
+.skill-progress-events { display: grid; gap: 3px; margin-top: 6px; padding-left: 8px; border-left: 2px solid var(--vscode-panel-border, transparent); }
+.skill-progress-event { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; }
+.skill-progress-event time { font-variant-numeric: tabular-nums; }
+.skill-progress-event span { min-width: 0; overflow-wrap: anywhere; }
+.skill-quality-gates { display: grid; gap: 5px; padding-top: 2px; }
+.skill-quality-title { color: var(--vscode-foreground); }
+.skill-quality-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 4px 12px; }
+.skill-quality-item { min-width: 0; display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--vscode-panel-border, transparent); padding-bottom: 3px; }
+.skill-quality-item span { min-width: 0; overflow-wrap: anywhere; }
+.skill-quality-item span:last-child { flex: none; font-variant-numeric: tabular-nums; }
+.skill-quality-item[data-status="passed"] span:last-child { color: var(--vscode-testing-iconPassed, #2ea043); }
+.skill-quality-item[data-status="failed"] span:last-child { color: var(--vscode-errorForeground); }
 .skill-artifacts {
   display: grid;
   gap: 5px;
@@ -825,6 +953,9 @@ pre {
   #pending-edit-count { text-align: left; }
   .skill-artifact-row { grid-template-columns: minmax(100px, 1fr) auto; }
   .skill-artifact-row button:last-child { grid-column: 2; }
+  .skill-progress-stages { grid-template-columns: 1fr; }
+  .skill-progress-stage + .skill-progress-stage { padding-left: 0; border-left: 0; border-top: 1px solid var(--vscode-panel-border, transparent); }
+  .skill-quality-list { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 420px) {

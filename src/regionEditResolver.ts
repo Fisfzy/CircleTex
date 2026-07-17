@@ -34,6 +34,7 @@ const TRANSPARENT_COMMANDS = new Set([
   "emph", "underline", "uline", "sout", "mbox", "hbox",
   "MakeUppercase", "MakeLowercase"
 ]);
+const TRANSPARENT_LAYOUT_COMMAND_RE = /\\(?:hspace|vspace)\*?\{[^{}]*\}|\\(?:noindent|par|quad|qquad|enspace|thinspace|medspace|thickspace|smallskip|medskip|bigskip|newline|linebreak)\b/gu;
 
 export function resolveRegionEditSourceRange(mapping: SourceMapping): RegionEditSourceRange {
   const candidates = regionEditSourceRangeCandidates(mapping);
@@ -118,6 +119,7 @@ function isSafeTransparentRange(
     structural = `${structural.slice(0, localStart)}${" ".repeat(token.end - token.start)}${structural.slice(token.end - start)}`;
   }
   structural = structural.replace(/\s/gu, "");
+  structural = structural.replace(TRANSPARENT_LAYOUT_COMMAND_RE, "");
   let index = 0;
   let depth = 0;
   while (index < structural.length) {

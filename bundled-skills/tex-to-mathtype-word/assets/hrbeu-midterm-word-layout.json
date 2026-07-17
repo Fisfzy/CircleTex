@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "profile": "hrbeu_midterm_report",
+  "page": {
+    "widthCm": 21.0,
+    "heightCm": 29.7,
+    "topMarginCm": 2.54,
+    "bottomMarginCm": 2.54,
+    "leftMarginCm": 3.17,
+    "rightMarginCm": 3.17,
+    "headerDistancePt": 25.0,
+    "footerDistancePt": 20.0
+  },
+  "body": {
+    "latinFont": "Times New Roman",
+    "eastAsiaFont": "宋体",
+    "fontSizePt": 12.0,
+    "firstLineIndentCm": 0.74,
+    "lineSpacingPt": 22.0,
+    "spaceBeforePt": 0.0,
+    "spaceAfterPt": 0.0
+  },
+  "headings": [
+    { "level": 1, "fontSizePt": 16.0, "spaceBeforePt": 12.0, "spaceAfterPt": 6.0 },
+    { "level": 2, "fontSizePt": 15.0, "spaceBeforePt": 12.0, "spaceAfterPt": 6.0 },
+    { "level": 3, "fontSizePt": 14.0, "spaceBeforePt": 12.0, "spaceAfterPt": 6.0 },
+    { "level": 4, "fontSizePt": 12.0, "spaceBeforePt": 12.0, "spaceAfterPt": 6.0 }
+  ],
+  "caption": {
+    "latinFont": "Times New Roman",
+    "eastAsiaFont": "宋体",
+    "fontSizePt": 10.5,
+    "spaceBeforePt": 3.0,
+    "spaceAfterPt": 6.0
+  },
+  "header": {
+    "text": "哈尔滨工程大学硕士学位论文中期报告",
+    "eastAsiaFont": "宋体",
+    "fontSizePt": 9.0,
+    "bottomBorder": true
+  },
+  "toc": {
+    "title": "目录",
+    "titleFont": "黑体",
+    "titleFontSizePt": 16.0,
+    "levels": 3
+  },
+  "cover": {
+    "school": "哈尔滨工程大学",
+    "reportLine": "攻读硕士学位研究生论文",
+    "reportName": "中期报告",
+    "titleFont": "黑体",
+    "schoolFontSizePt": 22.0,
+    "reportFontSizePt": 18.0,
+    "fieldFontSizePt": 16.0,
+    "dateFontSizePt": 12.0
+  }
+}

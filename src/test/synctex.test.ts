@@ -18,6 +18,23 @@ describe("跨页文字选区的 SyncTeX 位置", () => {
     assert.deepEqual(locations.map((location) => location.page), [7, 7, 8, 8]);
     assert.deepEqual(locations[2].point, { x: 40, y: 80 });
   });
+
+  it("将区域框选的定位点限制为均匀分布的六个点", () => {
+    const anchors = Array.from({ length: 16 }, (_, index) => ({ x: 20 + index * 10, y: 100 + index * 5 }));
+    const locations = selectionLocations({
+      kind: "region",
+      text: "区域文字",
+      page: 3,
+      start: { x: 10, y: 90 },
+      end: { x: 190, y: 190 },
+      bounds: { x: 0, y: 0, width: 220, height: 220 },
+      anchors,
+      fragments: [{ text: "区域文字", start: { x: 10, y: 90 }, end: { x: 190, y: 190 }, rects: [{ x: 10, y: 90, width: 180, height: 20 }], lineIndex: 0 }]
+    });
+    assert.equal(locations.length, 6);
+    assert.deepEqual(locations[0].point, { x: 10, y: 90 });
+    assert.deepEqual(locations.at(-1)?.point, { x: 190, y: 190 });
+  });
 });
 
 describe("区域锚点源码顺序", () => {

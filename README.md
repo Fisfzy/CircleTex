@@ -8,7 +8,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/VS%20Code-^1.95.0-blue?logo=visualstudiocode" alt="VS Code" />
-  <img src="https://img.shields.io/badge/version-0.8.4-brightgreen" alt="Version" />
+  <img src="https://img.shields.io/badge/version-0.10.5-brightgreen" alt="版本" />
   <img src="https://img.shields.io/badge/platform-Windows-lightgrey?logo=windows" alt="Platform" />
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License" />
 </p>
@@ -34,6 +34,7 @@
 | 导师批注 "这段重写" 不知从何下手 | **AI 助手（Codex / Snow）** 按你的要求生成候选修订 |
 | 怕改错、怕丢内容 | **自动备份 + 差异预览 + 编译校验**，失败自动回滚 |
 | 多人修订痕迹混乱 | **直接模式**：干净 PDF 无残留标记；**修订模式**：保留 redline 痕迹 |
+| 没有 Word 底稿，但必须提交 DOCX | 从 `main.tex` **无底稿导出 Word**，公式全部为 MathType 可编辑对象 |
 
 ---
 
@@ -62,6 +63,16 @@
 - 在审阅窗口的现有任务选择框中切换“局部修订”或已导入 Skill，整篇任务不要求 PDF 选区
 - Skill 仅对论文副本运行，首版支持**分析任务**和**独立产物**，不允许直接修改或编译真实 `main.tex` / `main.pdf`
 - 首版仅支持 Codex；选择 Snow 时在执行前明确拦截。产物发布到 `exports/circletex/<skill>/<时间戳>/`，完成后只显示列表
+- 独立运行面板显示 Skill 名称、已用时间、总进度、阶段状态和真实计数；详细信息默认收起，失败阶段会保留，不会覆盖论文编译进度
+
+### 保留版式的无底稿 MathType Word 导出
+- 扩展内置“保留版式的无底稿 MathType Word 导出”Skill，无需另行导入，也不要求存在 `main.docx`
+- 正文唯一来源是隔离复制的 `main.tex`；CircleTeX 根据内置规则动态生成自己的 `reference.docx`，不使用 Pandoc 默认 Word 作为正式排版骨架
+- 自动重建封面、Word 目录、A4 页面、页边距、四级标题、题注、页眉横线和三节页码体系，并保留 LaTeX 强制分页与复杂并排图片
+- 全部行内与独立公式均输出为单个 `Equation.DSMT4` MathType OLE 对象，禁止 OMML、图片公式和普通文本降级
+- 每个不同公式都要通过保存重开、反向回译和语义一致性校验；最终 DOCX 还要通过公式、页面、分节、页码、目录、标题和分页门禁
+- `main.pdf` 保持只读并用于页数参照；Word 与 TeX 排版引擎不同，目标是学校格式和结构一致，不承诺逐像素或逐页完全相同
+- 导出由 CircleTeX 的确定性执行器完成，不依赖 Agent 改写正文；完成后在现有任务面板展示公式与版式质量门禁，且不会自动跳转
 
 ### 🔄 SyncTeX 智能定位 / Smart SyncTeX Mapping
 - PDF 选区自动映射到 `main.tex` 源行范围
@@ -87,7 +98,7 @@
 ### 安装 / Installation
 
 ```powershell
-code --install-extension .\circletex-0.9.1.vsix --force
+code --install-extension .\circletex-0.10.5.vsix --force
 ```
 
 ### 使用 / Usage
@@ -118,6 +129,15 @@ code --install-extension .\circletex-0.9.1.vsix --force
 3. 在 PDF 审阅底部的“任务”选择框中选择该 Skill
 4. 输入任务要求并交给 Codex 执行；可复用同一按钮取消任务
 5. 在完成后的产物列表中主动打开文件，或从左侧查看任务历史
+
+### 导出 MathType Word
+
+1. 打开 PDF 审阅，在底部“任务”选择框中选择“无底稿 MathType Word 导出”
+2. 输入导出要求，例如“从 main.tex 导出正式 Word”，点击现有任务按钮
+3. 在独立 Skill 面板查看阶段、真实公式计数和已用时间；需要时展开“详细信息”，导出期间不要关闭当前 VS Code 窗口
+4. 从完成后的产物列表打开 `main_mathtype.docx` 或转换报告
+
+正式产物要求本机已安装 Microsoft Word 与 MathType 7。任一公式无法生成稳定的 `Equation.DSMT4` 对象时，任务会整体失败，不会输出降级公式。
 
 ---
 
@@ -160,6 +180,7 @@ code --install-extension .\circletex-0.9.1.vsix --force
 - **VS Code** 1.95.0+
 - **XeLaTeX** + **SyncTeX**（PATH 可用）
 - **Codex CLI** 或 **Snow CLI**（AI 功能需要，至少一个）
+- **PowerShell 7、Python 3、Pandoc、Microsoft Word、MathType 7、pywin32**（无底稿 MathType Word 导出需要）
 
 ---
 

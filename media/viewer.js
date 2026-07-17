@@ -9,6 +9,10 @@ const elements = {
   viewer: document.getElementById("viewer"),
   pages: document.getElementById("pages"),
   loading: document.getElementById("loading"),
+  loadingLabel: document.getElementById("loading-label"),
+  loadingValue: document.getElementById("loading-value"),
+  loadingTrack: document.getElementById("loading-track"),
+  loadingFill: document.getElementById("loading-fill"),
   previousPage: document.getElementById("previous-page"),
   nextPage: document.getElementById("next-page"),
   pageNumber: document.getElementById("page-number"),
@@ -53,6 +57,19 @@ const elements = {
   showDiff: document.getElementById("show-diff"),
   apply: document.getElementById("apply"),
   discard: document.getElementById("discard"),
+  skillProgress: document.getElementById("skill-progress"),
+  skillProgressName: document.getElementById("skill-progress-name"),
+  skillProgressState: document.getElementById("skill-progress-state"),
+  skillProgressElapsed: document.getElementById("skill-progress-elapsed"),
+  skillProgressValue: document.getElementById("skill-progress-value"),
+  skillProgressTrack: document.getElementById("skill-progress-track"),
+  skillProgressFill: document.getElementById("skill-progress-fill"),
+  skillProgressStages: document.getElementById("skill-progress-stages"),
+  skillProgressMessage: document.getElementById("skill-progress-message"),
+  skillProgressDetails: document.getElementById("skill-progress-details"),
+  skillProgressEvents: document.getElementById("skill-progress-events"),
+  skillQualityGates: document.getElementById("skill-quality-gates"),
+  skillQualityList: document.getElementById("skill-quality-list"),
   compileProgress: document.getElementById("compile-progress"),
   compileProgressLabel: document.getElementById("compile-progress-label"),
   compileProgressValue: document.getElementById("compile-progress-value"),
@@ -132,6 +149,7 @@ const state = {
   document: undefined,
   pageStates: [],
   loadGeneration: 0,
+  pdfLoadSequence: 0,
   scale: clamp(Number(persisted.scale) || 1.25, 0.45, 3),
   fitMode: persisted.fitMode !== false,
   currentPage: initialPageNumber,
@@ -181,6 +199,12 @@ const state = {
   skills: [],
   selectedTask: "revision",
   skillTaskRunning: false,
+  skillProgressPercent: 0,
+  skillProgressStartedAt: undefined,
+  skillProgressElapsedSeconds: 0,
+  skillProgressTimer: undefined,
+  skillProgressStages: [],
+  skillProgressEvents: [],
   scrollFrame: 0,
   saveTimer: undefined,
   resizeTimer: undefined,
@@ -214,15 +238,18 @@ function showImmediateStartupPreview() {
 }
 
 async function loadPdf({ preservePosition = true } = {}) {
+  const requestId = ++state.pdfLoadSequence;
   state.pdfRefreshInProgress = true;
   try {
-    await loadPdfCore({ preservePosition });
+    await loadPdfCore({ preservePosition, requestId });
   } finally {
-    state.pdfRefreshInProgress = false;
+    if (requestId === state.pdfLoadSequence) {
+      state.pdfRefreshInProgress = false;
+    }
   }
 }
 
-async function loadPdfCore({ preservePosition = true } = {}) {
+async function loadPdfCore({ preservePosition = true, requestId }) {
   const loadStartedAt = performance.now();
   const restore = preservePosition && state.document ? captureViewState() : {
     pageNumber: positivePage(persisted.pageNumber) || state.currentPage,
@@ -233,7 +260,7 @@ async function loadPdfCore({ preservePosition = true } = {}) {
     scale: state.scale,
     fitMode: state.fitMode
   };
-  setLoading("正在读取 main.pdf……");
+  setLoading("正在读取 main.pdf……", 8);
 
   const readStartedAt = performance.now();
   if (state.compileProgressActive) {
@@ -243,8 +270,14 @@ async function loadPdfCore({ preservePosition = true } = {}) {
   if (!response.ok) {
     throw new Error(`无法读取 main.pdf：${response.status}`);
   }
-  const data = new Uint8Array(await response.arrayBuffer());
+  const data = await readPdfResponse(response, (loaded, total) => {
+    if (requestId !== state.pdfLoadSequence) return;
+    const percent = total > 0 ? 10 + (loaded / total) * 42 : 28;
+    setLoading(total > 0 ? "正在读取 main.pdf……" : "正在读取 main.pdf……", percent, total <= 0);
+  });
+  ensureCurrentPdfLoad(requestId);
   reportPerformance("PDF 文件读取", readStartedAt);
+  setLoading("正在解析 PDF 文档……", 55, true);
   const workerStartedAt = performance.now();
   const loadingTask = pdfjs.getDocument({
     data,
@@ -253,7 +286,9 @@ async function loadPdfCore({ preservePosition = true } = {}) {
     standardFontDataUrl: config.standardFontsUri
   });
   const nextDocument = await loadingTask.promise;
+  ensureCurrentPdfLoad(requestId);
   reportPerformance("PDF Worker 解析", workerStartedAt);
+  setLoading("正在读取当前页面信息……", 68);
   const restorePageNumber = clamp(restore.pageNumber, 1, nextDocument.numPages);
   let preferredMetadata;
   try {
@@ -262,6 +297,7 @@ async function loadPdfCore({ preservePosition = true } = {}) {
     await nextDocument.destroy();
     throw error;
   }
+  ensureCurrentPdfLoad(requestId);
 
   const oldDocument = state.document;
   const refreshSnapshot = capturePageSnapshot(restore.pageNumber);
@@ -288,6 +324,7 @@ async function loadPdfCore({ preservePosition = true } = {}) {
     number: index + 1
   }));
   const shellsStartedAt = performance.now();
+  setLoading("正在建立连续页面……", 76);
   buildPageShells(initialMetadata, false);
   elements.pageCount.textContent = `/ ${nextDocument.numPages}`;
   elements.pageNumber.max = String(nextDocument.numPages);
@@ -297,6 +334,7 @@ async function loadPdfCore({ preservePosition = true } = {}) {
   attachStartupPreview(state.pageStates[restorePageNumber - 1]);
   await nextFrame();
   await nextFrame();
+  ensureCurrentPdfLoad(requestId);
   restoreViewState({ ...restore, pageNumber: restorePageNumber });
   immediateStartupPreview?.remove();
   reportPerformance("PDF 首屏页面壳体", shellsStartedAt);
@@ -311,7 +349,7 @@ async function loadPdfCore({ preservePosition = true } = {}) {
       if (state.loadGeneration === generation) reportPerformance("PDF 首屏低清预览", previewStartedAt);
     });
   }
-  hideLoading();
+  setLoading("正在渲染当前页并准备文字选择……", 90, true);
   setStatus("PDF 页面已显示，正在准备清晰页面与文字选择……", "busy");
   state.pdfRefreshInProgress = false;
   if (state.compileProgressActive) {
@@ -325,6 +363,9 @@ async function loadPdfCore({ preservePosition = true } = {}) {
     try {
       await previewPromise.catch((error) => console.error(error));
       if (state.loadGeneration !== generation) return;
+      if (requestId !== state.pdfLoadSequence) return;
+      setLoading("PDF 页面已显示，正在后台准备清晰文字层", 100);
+      hideLoading();
       if (state.currentPage !== restorePageNumber) {
         primaryRecord.status = "idle";
         return;
@@ -332,6 +373,7 @@ async function loadPdfCore({ preservePosition = true } = {}) {
       const primaryRenderStartedAt = performance.now();
       await renderPageRecord(primaryRecord, { primary: true });
       if (state.loadGeneration !== generation) return;
+      if (requestId !== state.pdfLoadSequence) return;
       reportPerformance("PDF 当前页渲染", primaryRenderStartedAt);
       reportPerformance("PDF 刷新总计", loadStartedAt);
     } finally {
@@ -348,6 +390,41 @@ async function loadPdfCore({ preservePosition = true } = {}) {
     reportPerformance("PDF 页面元数据扫描", metadataStartedAt);
   }, (error) => console.error(error));
   updateVisiblePages();
+}
+
+async function readPdfResponse(response, onProgress) {
+  const total = Number(response.headers.get("content-length")) || 0;
+  if (!response.body?.getReader) {
+    const data = new Uint8Array(await response.arrayBuffer());
+    onProgress(data.byteLength, data.byteLength);
+    return data;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let loaded = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value?.byteLength) {
+      chunks.push(value);
+      loaded += value.byteLength;
+      onProgress(loaded, total);
+    }
+  }
+  const data = new Uint8Array(loaded);
+  let offset = 0;
+  for (const chunk of chunks) {
+    data.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  onProgress(loaded, total || loaded);
+  return data;
+}
+
+function ensureCurrentPdfLoad(requestId) {
+  if (requestId !== state.pdfLoadSequence) {
+    throw new DOMException("PDF 加载已被新的刷新请求替代。", "AbortError");
+  }
 }
 
 async function readSinglePageMetadata(documentProxy, pageNumber) {
@@ -3183,6 +3260,290 @@ function clearSkillArtifacts() {
   elements.skillArtifacts.hidden = true;
 }
 
+const WORD_SKILL_STAGES = [
+  { id: "prepare-copy", label: "准备副本" },
+  { id: "parse-formulas", label: "解析公式" },
+  { id: "build-word", label: "生成基础 Word" },
+  { id: "create-mathtype", label: "创建 MathType" },
+  { id: "assemble-formulas", label: "装配公式" },
+  { id: "apply-styles", label: "设置样式" },
+  { id: "validate-integrity", label: "完整性验收" },
+  { id: "publish", label: "发布" }
+];
+
+const GENERIC_SKILL_STAGES = [
+  { id: "prepare-copy", label: "准备副本" },
+  { id: "run-skill", label: "执行 Skill" },
+  { id: "validate-integrity", label: "验证产物" },
+  { id: "publish", label: "发布" }
+];
+
+function initialSkillStages(skillId) {
+  const definitions = skillId === "tex-to-mathtype-word" ? WORD_SKILL_STAGES : GENERIC_SKILL_STAGES;
+  return definitions.map((stage) => ({ ...stage, state: "pending", count: "" }));
+}
+
+function startSkillProgress(message) {
+  clearInterval(state.skillProgressTimer);
+  state.skillProgressPercent = 0;
+  state.skillProgressStartedAt = Date.now();
+  state.skillProgressElapsedSeconds = 0;
+  state.skillProgressStages = initialSkillStages(message.skillId);
+  state.skillProgressEvents = [];
+  elements.skillProgress.hidden = false;
+  elements.skillProgress.dataset.state = "running";
+  elements.skillProgress.classList.remove("is-indeterminate");
+  elements.skillProgressName.textContent = boundedUiText(message.skillName, 80) || "Skill 任务";
+  elements.skillProgressState.textContent = "运行";
+  elements.skillProgressState.dataset.state = "running";
+  elements.skillProgressDetails.open = false;
+  elements.skillProgressEvents.replaceChildren();
+  elements.skillQualityList.replaceChildren();
+  elements.skillQualityGates.hidden = true;
+  renderSkillStages();
+  updateSkillElapsed();
+  state.skillProgressTimer = setInterval(updateSkillElapsed, 1_000);
+  updateSkillProgress({
+    stage: "preparing",
+    percent: 2,
+    message: boundedUiText(message.message, 200) || "正在准备 Skill 任务"
+  });
+}
+
+function updateSkillProgress(message) {
+  if (elements.skillProgress.hidden) {
+    startSkillProgress({ skillId: "", skillName: "Skill 任务", message: message.message });
+  }
+  const incomingPercent = Number(message.percent);
+  if (Number.isFinite(incomingPercent)) {
+    state.skillProgressPercent = Math.max(state.skillProgressPercent, clamp(incomingPercent, 0, 100));
+  }
+  if (Number.isSafeInteger(message.elapsedSeconds) && message.elapsedSeconds >= 0) {
+    state.skillProgressElapsedSeconds = Math.max(state.skillProgressElapsedSeconds, message.elapsedSeconds);
+  }
+  const progressMessage = boundedUiText(message.message, 200) || "正在执行 Skill 任务";
+  const detail = normalizedSkillStage(message.detail ?? (typeof message.stage === "object" ? message.stage : undefined));
+  if (detail) {
+    applySkillStage(detail);
+  } else {
+    applyLegacySkillStage(typeof message.stage === "string" ? message.stage : "running");
+  }
+  elements.skillProgress.dataset.state = "running";
+  elements.skillProgress.classList.toggle("is-indeterminate", Boolean(message.indeterminate));
+  elements.skillProgressState.textContent = "运行";
+  elements.skillProgressState.dataset.state = "running";
+  elements.skillProgressMessage.textContent = progressMessage;
+  elements.skillProgressValue.textContent = `${Math.round(state.skillProgressPercent)}%`;
+  elements.skillProgressFill.style.width = `${state.skillProgressPercent}%`;
+  elements.skillProgressTrack.setAttribute("aria-valuenow", String(Math.round(state.skillProgressPercent)));
+  appendSkillProgressEvent(progressMessage, detail);
+  updateSkillElapsed();
+  renderSkillStages();
+}
+
+function normalizedSkillStage(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const id = boundedUiText(value.id, 48);
+  const label = boundedUiText(value.label, 80);
+  const stageState = ["pending", "running", "completed", "failed"].includes(value.state) ? value.state : "running";
+  if (!id || !/^[a-z0-9][a-z0-9-]*$/.test(id)) {
+    return undefined;
+  }
+  const current = Number.isSafeInteger(value.current) && value.current >= 0 ? value.current : undefined;
+  const total = Number.isSafeInteger(value.total) && value.total >= 0 ? value.total : undefined;
+  const unit = boundedUiText(value.unit, 40);
+  return {
+    id,
+    label: label || id,
+    state: stageState,
+    current: current !== undefined && total !== undefined ? Math.min(current, total) : current,
+    total,
+    unit
+  };
+}
+
+function applySkillStage(detail) {
+  let index = state.skillProgressStages.findIndex((stage) => stage.id === detail.id);
+  if (index < 0 && state.skillProgressStages.length < 12) {
+    state.skillProgressStages.push({ id: detail.id, label: detail.label, state: "pending", count: "" });
+    index = state.skillProgressStages.length - 1;
+  }
+  if (index < 0) {
+    return;
+  }
+  if (detail.state === "running" || detail.state === "completed") {
+    for (let item = 0; item < index; item += 1) {
+      if (state.skillProgressStages[item].state !== "failed") {
+        state.skillProgressStages[item].state = "completed";
+      }
+    }
+  }
+  for (const [item, stage] of state.skillProgressStages.entries()) {
+    if (item !== index && stage.state === "running") {
+      stage.state = item < index ? "completed" : "pending";
+    }
+  }
+  const target = state.skillProgressStages[index];
+  target.label = detail.label || target.label;
+  target.state = detail.state;
+  target.count = skillStageCount(detail);
+}
+
+function applyLegacySkillStage(stage) {
+  const generic = !state.skillProgressStages.some((item) => item.id === "parse-formulas");
+  const id = stage === "preparing"
+    ? "prepare-copy"
+    : stage === "validating"
+      ? "validate-integrity"
+      : stage === "publishing"
+        ? "publish"
+        : generic ? "run-skill" : "parse-formulas";
+  const target = state.skillProgressStages.find((item) => item.id === id);
+  if (target) {
+    applySkillStage({ id, label: target.label, state: "running", current: undefined, total: undefined, unit: "" });
+  }
+}
+
+function skillStageCount(detail) {
+  if (detail.current === undefined) {
+    return "";
+  }
+  const count = detail.total === undefined ? String(detail.current) : `${detail.current}/${detail.total}`;
+  return detail.unit ? `${count} ${detail.unit}` : count;
+}
+
+function renderSkillStages() {
+  elements.skillProgressStages.replaceChildren();
+  for (const stage of state.skillProgressStages) {
+    const item = document.createElement("li");
+    item.className = "skill-progress-stage";
+    item.dataset.state = stage.state;
+    const status = document.createElement("span");
+    status.className = "skill-stage-status";
+    status.textContent = stage.state === "completed" ? "完成" : stage.state === "running" ? "运行" : stage.state === "failed" ? "失败" : "等待";
+    const content = document.createElement("span");
+    content.className = "skill-stage-content";
+    const label = document.createElement("span");
+    label.className = "skill-stage-label";
+    label.textContent = stage.label;
+    content.append(label);
+    if (stage.count) {
+      const count = document.createElement("span");
+      count.className = "skill-stage-count";
+      count.textContent = stage.count;
+      content.append(count);
+    }
+    item.append(status, content);
+    elements.skillProgressStages.append(item);
+  }
+}
+
+function appendSkillProgressEvent(message, detail) {
+  const count = detail ? skillStageCount(detail) : "";
+  const text = count ? `${message}（${count}）` : message;
+  if (state.skillProgressEvents.at(-1)?.text === text) {
+    return;
+  }
+  const elapsed = currentSkillElapsedSeconds();
+  state.skillProgressEvents.push({ elapsed, text });
+  if (state.skillProgressEvents.length > 40) {
+    state.skillProgressEvents.shift();
+  }
+  elements.skillProgressEvents.replaceChildren(...state.skillProgressEvents.map((event) => {
+    const row = document.createElement("div");
+    row.className = "skill-progress-event";
+    const time = document.createElement("time");
+    time.textContent = formatElapsed(event.elapsed);
+    const label = document.createElement("span");
+    label.textContent = event.text;
+    row.append(time, label);
+    return row;
+  }));
+}
+
+function finishSkillProgress(message, kind, qualityGates) {
+  clearInterval(state.skillProgressTimer);
+  state.skillProgressTimer = undefined;
+  state.skillProgressElapsedSeconds = currentSkillElapsedSeconds();
+  const success = kind === "completed";
+  if (success) {
+    state.skillProgressPercent = 100;
+    for (const stage of state.skillProgressStages) {
+      stage.state = "completed";
+    }
+  } else {
+    const running = state.skillProgressStages.find((stage) => stage.state === "running");
+    if (running) {
+      running.state = "failed";
+    }
+  }
+  elements.skillProgress.dataset.state = success ? "completed" : "failed";
+  elements.skillProgress.classList.remove("is-indeterminate");
+  elements.skillProgressState.textContent = success ? "完成" : kind === "cancelled" ? "已取消" : "失败";
+  elements.skillProgressState.dataset.state = success ? "completed" : "failed";
+  elements.skillProgressMessage.textContent = message;
+  elements.skillProgressValue.textContent = `${Math.round(state.skillProgressPercent)}%`;
+  elements.skillProgressFill.style.width = `${state.skillProgressPercent}%`;
+  elements.skillProgressTrack.setAttribute("aria-valuenow", String(Math.round(state.skillProgressPercent)));
+  appendSkillProgressEvent(message);
+  showSkillQualityGates(qualityGates);
+  updateSkillElapsed();
+  renderSkillStages();
+}
+
+function showSkillQualityGates(gates) {
+  elements.skillQualityList.replaceChildren();
+  if (!Array.isArray(gates) || gates.length === 0) {
+    elements.skillQualityGates.hidden = true;
+    return;
+  }
+  for (const gate of gates.slice(0, 12)) {
+    if (!gate || typeof gate !== "object") {
+      continue;
+    }
+    const label = boundedUiText(gate.label, 80);
+    const value = boundedUiText(gate.value, 80);
+    if (!label || !["passed", "failed"].includes(gate.status)) {
+      continue;
+    }
+    const item = document.createElement("div");
+    item.className = "skill-quality-item";
+    item.dataset.status = gate.status;
+    const name = document.createElement("span");
+    name.textContent = label;
+    const result = document.createElement("span");
+    result.textContent = value || (gate.status === "passed" ? "通过" : "失败");
+    item.append(name, result);
+    elements.skillQualityList.append(item);
+  }
+  elements.skillQualityGates.hidden = elements.skillQualityList.childElementCount === 0;
+}
+
+function currentSkillElapsedSeconds() {
+  const local = state.skillProgressStartedAt ? Math.floor((Date.now() - state.skillProgressStartedAt) / 1_000) : 0;
+  return Math.max(local, state.skillProgressElapsedSeconds);
+}
+
+function updateSkillElapsed() {
+  elements.skillProgressElapsed.textContent = formatElapsed(currentSkillElapsedSeconds());
+}
+
+function formatElapsed(seconds) {
+  const value = Math.max(0, Math.floor(Number(seconds) || 0));
+  const hours = Math.floor(value / 3_600);
+  const minutes = Math.floor((value % 3_600) / 60);
+  const remaining = value % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`
+    : `${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`;
+}
+
+function boundedUiText(value, maximum) {
+  return typeof value === "string" ? value.trim().slice(0, maximum) : "";
+}
+
 function showSkillArtifacts(message) {
   clearSkillArtifacts();
   const title = document.createElement("div");
@@ -3238,8 +3599,13 @@ function finishCompileProgress(message, kind = "success") {
   }
 }
 
-function setLoading(message) {
-  elements.loading.textContent = message;
+function setLoading(message, percent = 0, indeterminate = false) {
+  const value = clamp(percent, 0, 100);
+  elements.loadingLabel.textContent = message;
+  elements.loadingValue.textContent = `${Math.round(value)}%`;
+  elements.loadingFill.style.width = `${value}%`;
+  elements.loadingTrack.setAttribute("aria-valuenow", String(Math.round(value)));
+  elements.loading.classList.toggle("is-indeterminate", Boolean(indeterminate));
   elements.loading.hidden = false;
 }
 
@@ -3677,13 +4043,13 @@ window.addEventListener("message", async (event) => {
       state.busyAction = "skillTask";
       elements.compile.disabled = true;
       clearSkillArtifacts();
-      updateCompileProgress({ percent: 2, message: message.message, indeterminate: false });
+      startSkillProgress(message);
       updateAnalyzeAvailability();
       updateManualEditAvailability();
       setStatus(message.message, "busy");
       break;
     case "skillTaskProgress":
-      updateCompileProgress(message);
+      updateSkillProgress(message);
       setStatus(message.message, "busy");
       break;
     case "skillTaskCancelling":
@@ -3693,7 +4059,7 @@ window.addEventListener("message", async (event) => {
       state.skillTaskRunning = false;
       state.busyAction = undefined;
       elements.compile.disabled = false;
-      finishCompileProgress("Skill 任务完成");
+      finishSkillProgress(message.summary || "Skill 任务完成", "completed", message.qualityGates);
       showSkillArtifacts(message);
       updateAnalyzeAvailability();
       updateManualEditAvailability();
@@ -3705,7 +4071,7 @@ window.addEventListener("message", async (event) => {
       state.skillTaskRunning = false;
       state.busyAction = undefined;
       elements.compile.disabled = false;
-      finishCompileProgress("Skill 任务已取消", "error");
+      finishSkillProgress(message.message || "Skill 任务已取消", "cancelled");
       updateAnalyzeAvailability();
       updateManualEditAvailability();
       setStatus(message.message || "Skill 任务已取消。", "ready");
@@ -3714,7 +4080,7 @@ window.addEventListener("message", async (event) => {
       state.skillTaskRunning = false;
       state.busyAction = undefined;
       elements.compile.disabled = false;
-      finishCompileProgress("Skill 任务失败", "error");
+      finishSkillProgress(message.message || "Skill 任务失败", "failed", message.qualityGates);
       updateAnalyzeAvailability();
       updateManualEditAvailability();
       setStatus(message.message || "Skill 任务失败。", "error");

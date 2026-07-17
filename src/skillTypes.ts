@@ -1,6 +1,6 @@
 export type SkillTaskType = "analysis" | "artifact";
 export type SkillScope = "document" | "selection" | "either";
-export type SkillInputPreset = "document" | "document-resources";
+export type SkillInputPreset = "document" | "document-resources" | "document-workspace";
 
 export interface SkillPermissionProfile {
   taskType: SkillTaskType;
@@ -11,6 +11,8 @@ export interface SkillPermissionProfile {
   network: false;
   supportedAgents: ["codex"];
   timeoutMinutes: number;
+  writableWorkDirectory?: boolean;
+  agentIndependent?: boolean;
 }
 
 export interface SkillPackageInspection {
@@ -45,6 +47,28 @@ export interface SkillTaskProgress {
   percent: number;
   message: string;
   indeterminate?: boolean;
+  detail?: SkillProgressStage;
+  elapsedSeconds?: number;
+  estimatedRemainingSeconds?: number;
+  metrics?: Record<string, number>;
+}
+
+export interface SkillProgressStage {
+  id: string;
+  label: string;
+  state: "pending" | "running" | "completed" | "failed";
+  current?: number;
+  total?: number;
+  unit?: string;
+}
+
+export interface SkillRunnerProgress extends Omit<SkillTaskProgress, "stage"> {}
+
+export interface SkillTaskQualityGate {
+  id: string;
+  label: string;
+  status: "passed" | "failed";
+  value: string;
 }
 
 export interface SkillTaskArtifact {
@@ -64,6 +88,7 @@ export interface SkillTaskResult {
   status: "completed" | "cancelled" | "failed";
   summary: string;
   warnings: string[];
+  qualityGates?: SkillTaskQualityGate[];
   artifacts: SkillTaskArtifact[];
   publishedDirectory?: string;
   startedAt: string;
