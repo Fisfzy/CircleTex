@@ -135,19 +135,63 @@ describe("图片命令解析与安全调整", () => {
   it("使用 SyncTeX 正向矩形复核 PDF.js 吸附边界", () => {
     const value = selection();
     assert.doesNotThrow(() => validateImageSelectionConsistency(value, []));
-    assert.doesNotThrow(() => validateImageSelectionConsistency(value, [{
+    const exact = validateImageSelectionConsistency(value, [{
       page: 3,
       x: 100,
       y: 200,
       width: 300,
       height: 180
-    }]));
-    assert.throws(() => validateImageSelectionConsistency(value, [{
+    }]);
+    assert.equal(exact?.coordinateVariant, "xy");
+    assert.deepEqual(exact?.syncTexBounds, { page: 3, x: 100 / 600, y: 200 / 800, width: 0.5, height: 0.225 });
+    assert.equal(validateImageSelectionConsistency(value, [{
       page: 3,
       x: 450,
       y: 500,
       width: 80,
       height: 60
-    }]), /不一致/u);
+    }]), undefined);
+  });
+
+  it("兼容 h/v 备用锚点与纵轴翻转的 SyncTeX 图片范围", () => {
+    const value = selection();
+    const byHv = validateImageSelectionConsistency(value, [{
+      page: 3,
+      x: 430,
+      y: 500,
+      h: 100,
+      v: 200,
+      width: 300,
+      height: 180
+    }]);
+    assert.equal(byHv?.coordinateVariant, "hv");
+
+    const flipped = validateImageSelectionConsistency(value, [{
+      page: 3,
+      x: 100,
+      y: 420,
+      width: 300,
+      height: 180
+    }]);
+    assert.equal(flipped?.coordinateVariant, "xy-flipped");
+  });
+
+  it("允许包含图片主体的外层排版容器，并将无关正向范围降级为无诊断", () => {
+    const value = selection();
+    const container = validateImageSelectionConsistency(value, [{
+      page: 3,
+      x: 70,
+      y: 170,
+      width: 360,
+      height: 240
+    }]);
+    assert.ok((container?.score ?? 0) >= 0.56);
+    assert.equal(validateImageSelectionConsistency(value, [{
+      page: 3,
+      x: 430,
+      y: 210,
+      width: 130,
+      height: 180
+    }]), undefined);
   });
 });

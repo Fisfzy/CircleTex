@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import {
   hashNormalizedText,
+  hasSameNormalizedText,
   normalizeLineEndings,
   resolveApplyRange,
   ResolvedApplyRange,
@@ -310,6 +311,7 @@ export class ReviewPanel implements vscode.Disposable {
         "queueImageEdit",
         "undoManualEdit",
         "redoManualEdit",
+        "removeManualEdit",
         "clearManualEdits",
         "resolveTrackedRevisions"
       ].includes(value.type)) {
@@ -388,6 +390,9 @@ export class ReviewPanel implements vscode.Disposable {
           break;
         case "redoManualEdit":
           this.redoManualEdit(value);
+          break;
+        case "removeManualEdit":
+          this.removeManualEdit(value);
           break;
         case "showManualEditsDiff":
           await this.showPendingManualEditsDiff(value);
@@ -683,11 +688,13 @@ export class ReviewPanel implements vscode.Disposable {
     const sequence = ++this.imageSelectionSequence;
     this.imageEditTarget = undefined;
     const selection = parsePdfImageSelectionPayload(message);
-    this.post({ type: "busy", action: "locateImage", requestId, message: "正在定位图片对应的 LaTeX 命令……" });
+    this.post({ type: "busy", action: "locateImage", requestId, message: "正在检查 PDF 与 SyncTeX 定位信息……" });
     await this.ensureArtifactsCurrent();
     await this.ensureSourceSaved();
+    this.post({ type: "busy", action: "locateImage", requestId, message: "正在从图片主体反向定位源码……" });
     const records = await this.locator.mapImageSelection(this.project, selection);
     const source = await fs.readFile(this.project.tex, "utf8");
+    this.post({ type: "busy", action: "locateImage", requestId, message: "正在筛选对应的图片命令……" });
     let candidates = chooseImageCandidatesByMappedLines(
       await findImageEditCandidates(source, this.project.root),
       records
@@ -697,11 +704,13 @@ export class ReviewPanel implements vscode.Disposable {
     }
     let candidate = candidates[0];
     if (candidates.length > 1) {
+      this.post({ type: "busy", action: "locateImage", requestId, message: "检测到多个候选图片，正在按页面位置消歧……" });
       candidate = await this.locator.disambiguateImageCandidate(this.project, candidates, selection);
       candidates = [candidate];
     }
+    this.post({ type: "busy", action: "locateImage", requestId, message: "正在生成图片尺寸调整候选……" });
     const forwardRecords = await this.locator.locateImageCandidateViews(this.project, candidate, selection.page);
-    validateImageSelectionConsistency(selection, forwardRecords);
+    const consistency = validateImageSelectionConsistency(selection, forwardRecords);
     if (this.disposed || sequence !== this.imageSelectionSequence) return;
     const currentSource = await fs.readFile(this.project.tex, "utf8");
     if (currentSource !== source) {
@@ -720,6 +729,8 @@ export class ReviewPanel implements vscode.Disposable {
       pageWidth: selection.pageWidth,
       pageHeight: selection.pageHeight,
       imageObjectName: selection.imageObjectName,
+      syncTexBounds: consistency?.syncTexBounds,
+      consistencyScore: consistency?.score,
       imagePath: target.imagePath,
       parameter: target.parameter,
       originalValue: target.originalDisplay,
@@ -1013,6 +1024,32 @@ export class ReviewPanel implements vscode.Disposable {
     }
   }
 
+  private removeManualEdit(message: WebviewMessage): void {
+    this.requireManualQueueVersion(message);
+    const editId = boundedIdentifier(message.editId, "待移除编辑");
+    const index = this.pendingManualEdits.findIndex((edit) => edit.id === editId);
+    if (index < 0) {
+      this.sendManualEditsState();
+      return;
+    }
+    this.pendingManualEdits.splice(index, 1);
+    this.redoManualEdits.splice(0);
+    this.releaseManualEditMode();
+    this.manualQueueVersion += 1;
+    this.clearManualPreview();
+    this.post({
+      type: "manualEditRemoved",
+      editId,
+      edits: this.pendingManualEdits.map(manualEditForWebview),
+      count: this.pendingManualEdits.length,
+      queueVersion: this.manualQueueVersion,
+      canUndo: this.pendingManualEdits.length > 0,
+      canRedo: false,
+      manualEditMode: this.manualEditModeForQueue(),
+      removedFromQueue: true
+    });
+  }
+
   private async runSkillTask(message: WebviewMessage): Promise<void> {
     this.requireTrustedWorkspace();
     if (this.activeSkillTask) {
@@ -1163,12 +1200,7 @@ export class ReviewPanel implements vscode.Disposable {
     const edits = [...this.pendingManualEdits];
     this.applying = true;
     try {
-      await this.ensureSourceSaved();
-      const document = await vscode.workspace.openTextDocument(vscode.Uri.file(this.project.tex));
-      const originalText = await fs.readFile(this.project.tex, "utf8");
-      if (document.isDirty || document.getText() !== originalText) {
-        throw new Error("批量手动修订要求编辑器与磁盘中的 main.tex 完全一致，请先保存并重新打开文件。");
-      }
+      const { document, sourceText: originalText } = await this.readSynchronizedSource();
       if (mode === "direct" && hasCircleTeXRevisions(originalText)) {
         throw new Error("main.tex 中仍有 CircleTeX 修订标记。直接编辑不会自动决定这些修订，请先选择“接受全部”或“拒绝全部”。");
       }
@@ -1227,12 +1259,7 @@ export class ReviewPanel implements vscode.Disposable {
     const edits = [...this.pendingManualEdits];
     this.applying = true;
     try {
-      await this.ensureSourceSaved();
-      const document = await vscode.workspace.openTextDocument(vscode.Uri.file(this.project.tex));
-      const originalText = await fs.readFile(this.project.tex, "utf8");
-      if (document.isDirty || document.getText() !== originalText) {
-        throw new Error("查看改动前，编辑器与磁盘中的 main.tex 必须完全一致。");
-      }
+      const { document, sourceText: originalText } = await this.readSynchronizedSource();
       if (mode === "direct" && hasCircleTeXRevisions(originalText)) {
         throw new Error("main.tex 中仍有 CircleTeX 修订标记。请先接受或拒绝现有修订，再预览直接编辑。");
       }
@@ -1269,12 +1296,7 @@ export class ReviewPanel implements vscode.Disposable {
     }
     this.applying = true;
     try {
-      await this.ensureSourceSaved();
-      const document = await vscode.workspace.openTextDocument(vscode.Uri.file(this.project.tex));
-      const originalText = await fs.readFile(this.project.tex, "utf8");
-      if (document.isDirty || document.getText() !== originalText) {
-        throw new Error("处理修订前，编辑器与磁盘中的 main.tex 必须完全一致。");
-      }
+      const { document, sourceText: originalText } = await this.readSynchronizedSource();
       if (!hasCircleTeXRevisions(originalText)) {
         throw new Error("main.tex 中没有可处理的 CircleTeX 修订标记。");
       }
@@ -1335,17 +1357,14 @@ export class ReviewPanel implements vscode.Disposable {
     originalText: string,
     stagedText: string
   ): Promise<CompileResult> {
-    const originalHash = sha256(originalText);
-    const documentVersion = document.version;
     this.postCompileProgress({ percent: 2, message: "正在创建 main.tex 备份" });
     const backupPath = await createTexBackup(this.project.root, originalText);
     const diskAfterBackup = await fs.readFile(this.project.tex, "utf8");
     if (
       this.disposed ||
       document.isDirty ||
-      document.version !== documentVersion ||
-      document.getText() !== originalText ||
-      sha256(diskAfterBackup) !== originalHash
+      !hasSameNormalizedText(document.getText(), originalText) ||
+      !hasSameNormalizedText(diskAfterBackup, originalText)
     ) {
       throw new Error("创建备份期间 main.tex 发生了变化，未写入手动修订。");
     }
@@ -1360,19 +1379,21 @@ export class ReviewPanel implements vscode.Disposable {
       this.postCompileProgress({ percent: 5, message: "正在写入已确认的编辑" });
       await replaceDocumentText(document, stagedText);
       const savedText = await fs.readFile(this.project.tex, "utf8");
-      if (savedText !== stagedText || document.getText() !== stagedText || document.isDirty) {
+      if (
+        !hasSameNormalizedText(savedText, stagedText) ||
+        !hasSameNormalizedText(document.getText(), stagedText) ||
+        document.isDirty
+      ) {
         throw new Error("main.tex 保存后的内容与手动修订预览不一致。");
       }
       this.postCompileProgress({ percent: 8, message: "编辑已写入，准备编译" });
-      const stagedDocumentVersion = document.version;
       const result = await this.runCompileCore(async () => {
         const commitDiskText = await fs.readFile(this.project.tex, "utf8");
         if (
           this.disposed ||
           document.isDirty ||
-          document.version !== stagedDocumentVersion ||
-          document.getText() !== stagedText ||
-          commitDiskText !== stagedText
+          !hasSameNormalizedText(document.getText(), stagedText) ||
+          !hasSameNormalizedText(commitDiskText, stagedText)
         ) {
           throw new Error("main.tex 在编译产物提交前发生了变化，已恢复上一版编译产物。");
         }
@@ -1385,9 +1406,8 @@ export class ReviewPanel implements vscode.Disposable {
         if (
           this.disposed ||
           document.isDirty ||
-          document.version !== stagedDocumentVersion ||
-          document.getText() !== stagedText ||
-          finalDiskText !== stagedText
+          !hasSameNormalizedText(document.getText(), stagedText) ||
+          !hasSameNormalizedText(finalDiskText, stagedText)
         ) {
           postCommitWarning = "编译产物已提交后检测到 main.tex 又发生了变化；当前 PDF 可能早于源码，请保存源码并重新编译。";
         }
@@ -1749,6 +1769,16 @@ export class ReviewPanel implements vscode.Disposable {
     }
   }
 
+  private async readSynchronizedSource(): Promise<{ document: vscode.TextDocument; sourceText: string }> {
+    await this.ensureSourceSaved();
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(this.project.tex));
+    const sourceText = await fs.readFile(this.project.tex, "utf8");
+    if (!hasSameNormalizedText(document.getText(), sourceText)) {
+      throw new Error("main.tex 已被外部程序更新，编辑器内容尚未同步。请比较更改后关闭并重新打开该文件，再重新生成批量修订。");
+    }
+    return { document, sourceText };
+  }
+
   private async ensureMappingCurrent(mapping: SourceMapping): Promise<void> {
     const current = await fs.readFile(this.project.tex, "utf8");
     if (sha256(current) !== mapping.documentHash) {
@@ -1970,6 +2000,10 @@ export class ReviewPanel implements vscode.Disposable {
           <button id="manual-clear" class="icon-button" title="清空待编译编辑" aria-label="清空待编译编辑" disabled>×</button>
         </div>
       </div>
+      <details id="pending-edits-details" class="pending-edits-details" hidden>
+        <summary><span>待编译编辑</span><span id="pending-edits-summary" class="detail-summary"></span></summary>
+        <ol id="pending-edits-list" class="pending-edits-list"></ol>
+      </details>
       <div class="prompt-bar">
         <div class="task-selector-row">
           <label for="task-mode">任务</label>
@@ -2222,7 +2256,7 @@ async function replaceDocumentText(document: vscode.TextDocument, value: string)
   if (!(await vscode.workspace.applyEdit(edit))) {
     throw new Error("VS Code 未能写入批量手动修订。");
   }
-  if (document.getText() !== value) {
+  if (!hasSameNormalizedText(document.getText(), value)) {
     throw new Error("编辑器中的批量手动修订结果与预览不一致。");
   }
   if (!(await document.save())) {
@@ -2239,8 +2273,8 @@ async function restoreDocumentText(
     const diskText = await fs.readFile(document.uri.fsPath, "utf8");
     const editorText = document.getText();
     if (
-      ![originalText, stagedText].includes(diskText) ||
-      ![originalText, stagedText].includes(editorText)
+      ![originalText, stagedText].some((expected) => hasSameNormalizedText(diskText, expected)) ||
+      ![originalText, stagedText].some((expected) => hasSameNormalizedText(editorText, expected))
     ) {
       return false;
     }
@@ -2250,7 +2284,9 @@ async function restoreDocumentText(
       await fs.writeFile(document.uri.fsPath, originalText, "utf8");
     }
     const restoredDisk = await fs.readFile(document.uri.fsPath, "utf8");
-    return restoredDisk === originalText && document.getText() === originalText && !document.isDirty;
+    return hasSameNormalizedText(restoredDisk, originalText) &&
+      hasSameNormalizedText(document.getText(), originalText) &&
+      !document.isDirty;
   } catch {
     return false;
   }

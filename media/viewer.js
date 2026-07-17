@@ -1522,6 +1522,15 @@ function renderImageEditDraft() {
   const original = document.createElement("div");
   original.className = "image-edit-original";
   applyNormalizedRectStyle(original, rect);
+  const syncTex = draft.syncTexBounds;
+  if (syncTex && Number.isFinite(syncTex.x) && Number.isFinite(syncTex.y) &&
+    Number.isFinite(syncTex.width) && Number.isFinite(syncTex.height)) {
+    const diagnostic = document.createElement("div");
+    diagnostic.className = "image-edit-synctex";
+    diagnostic.title = "SyncTeX 源码命令定位范围";
+    applyNormalizedRectStyle(diagnostic, syncTex);
+    overlay.append(diagnostic);
+  }
   const scaledWidth = clamp(rect.width * draft.factor, 0.01, 1);
   const scaledHeight = clamp(rect.height * draft.factor, 0.01, 1);
   const centerX = rect.x + rect.width / 2;
@@ -4168,6 +4177,7 @@ window.addEventListener("message", async (event) => {
         originalValue: typeof message.originalValue === "string" ? message.originalValue : "原尺寸",
         roughBounds: message.roughBounds,
         snappedBounds: message.snappedBounds,
+        syncTexBounds: message.syncTexBounds,
         pageWidth: message.pageWidth,
         pageHeight: message.pageHeight,
         factor: 1

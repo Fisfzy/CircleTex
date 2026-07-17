@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { normalizeLineEndings, resolveApplyRange, RevisionSnapshot } from "../applyRange";
+import { hasSameNormalizedText, normalizeLineEndings, resolveApplyRange, RevisionSnapshot } from "../applyRange";
 
 function snapshot(baseText: string, target: string, requestedStart?: number): RevisionSnapshot {
   const startOffset = requestedStart ?? baseText.indexOf(target);
@@ -119,5 +119,15 @@ describe("候选修订目标定位", () => {
       sourceText: "\n乙"
     };
     assert.throws(() => resolveApplyRange(invalid, baseText), /换行符中间/);
+  });
+});
+
+describe("源码同步比较", () => {
+  it("将不同换行符视为相同源码", () => {
+    assert.equal(hasSameNormalizedText("第一行\r\n第二行\r\n", "第一行\n第二行\n"), true);
+  });
+
+  it("保留实际文本变化的检测能力", () => {
+    assert.equal(hasSameNormalizedText("第一行\n第二行\n", "第一行\n已修改第二行\n"), false);
   });
 });

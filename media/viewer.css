@@ -656,12 +656,17 @@ pre {
   pointer-events: none;
 }
 .image-edit-preview,
-.image-edit-original {
+.image-edit-original,
+.image-edit-synctex {
   position: absolute;
 }
 .image-edit-original {
   border: 1px dashed color-mix(in srgb, var(--vscode-descriptionForeground) 78%, transparent);
   background: transparent;
+}
+.image-edit-synctex {
+  border: 1px dashed var(--vscode-charts-orange, #d18616);
+  background: rgb(209 134 22 / 0.04);
 }
 .image-edit-preview {
   border: 2px solid var(--vscode-focusBorder, #007acc);

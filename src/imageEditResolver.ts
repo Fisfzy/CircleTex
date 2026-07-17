@@ -2,8 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { NormalizedManualEditRect, validateManualEditRects } from "./manualEdits";
-import { ImagePdfSelection, SyncTexRecord } from "./types";
-import { nearlySamePdfRect } from "./imageBoundary";
+import { ImagePdfSelection, PdfRect, SyncTexRecord, SyncTexViewRecord } from "./types";
 
 export type ImageSizeParameter = "width" | "height" | "scale" | "subfigureWidth";
 
@@ -46,6 +45,12 @@ export interface PendingImageEdit {
   originalValue: string;
   candidateValue: string;
   factor: number;
+}
+
+export interface ImageSelectionConsistency {
+  score: number;
+  coordinateVariant: "xy" | "hv" | "xy-flipped" | "hv-flipped";
+  syncTexBounds: NormalizedManualEditRect;
 }
 
 const INCLUDE_GRAPHICS = /\\includegraphics\s*(?:\[([^\]]*)\])?\s*\{([^{}]+)\}/gu;
@@ -182,22 +187,41 @@ export function createImageEditTarget(
 
 export function validateImageSelectionConsistency(
   selection: ImagePdfSelection,
-  forwardRecords: readonly import("./types").SyncTexViewRecord[]
-): void {
+  forwardRecords: readonly SyncTexViewRecord[]
+): ImageSelectionConsistency | undefined {
   if (forwardRecords.length === 0) {
-    return;
+    return undefined;
   }
   const matchingPage = forwardRecords.filter((record) => record.page === selection.page);
   if (!matchingPage.some((record) => Number.isFinite(record.width) && Number.isFinite(record.height))) {
-    return;
+    return undefined;
   }
-  const compatible = matchingPage.some((record) => {
-    const rects = syncTexRecordRects(record);
-    return rects.some((rect) => nearlySamePdfRect(selection.bounds, rect, 8) || imageRectOverlap(selection.bounds, rect) >= 0.72);
-  });
-  if (!compatible) {
-    throw new Error("PDF.js 吸附边界与 SyncTeX 图片命令位置不一致，已拒绝调整。请缩小选框后重试。");
+  const comparisons = matchingPage.flatMap((record) => syncTexRecordRects(record, selection.pageHeight).map((item) => {
+    const normalized = normalizePdfRect(item.rect, selection.pageWidth, selection.pageHeight);
+    return {
+      ...item,
+      normalized,
+      score: scoreImageRectMatch(normalizePdfRect(selection.bounds, selection.pageWidth, selection.pageHeight), normalized)
+    };
+  })).filter((item, index, all) => !all.slice(0, index).some((other) =>
+    Math.abs(other.normalized.x - item.normalized.x) < 0.0001 &&
+    Math.abs(other.normalized.y - item.normalized.y) < 0.0001 &&
+    Math.abs(other.normalized.width - item.normalized.width) < 0.0001 &&
+    Math.abs(other.normalized.height - item.normalized.height) < 0.0001
+  )).sort((left, right) => right.score - left.score);
+  const best = comparisons[0];
+  const runnerUp = comparisons[1];
+  const hasClearWinner = !runnerUp || best.score >= runnerUp.score + 0.08;
+  if (!best || best.score < 0.56 || !hasClearWinner) {
+    // SyncTeX view 对部分 \includegraphics 只返回外层行盒或图注节点；
+    // 图片命令已经由多点 SyncTeX edit 和源码行消歧确定，此处仅提供可用的可视化复核。
+    return undefined;
   }
+  return {
+    score: best.score,
+    coordinateVariant: best.coordinateVariant,
+    syncTexBounds: { page: selection.page, ...best.normalized }
+  };
 }
 
 export function createPendingImageEdit(
@@ -275,21 +299,63 @@ function parseSimpleSizeValue(parameter: "width" | "height" | "scale", raw: stri
   return Number.isFinite(numeric) && numeric > 0 ? { numeric, suffix } : undefined;
 }
 
-function syncTexRecordRects(record: import("./types").SyncTexViewRecord): import("./types").PdfRect[] {
-  const results: import("./types").PdfRect[] = [];
+function syncTexRecordRects(
+  record: SyncTexViewRecord,
+  pageHeight: number
+): Array<{ rect: PdfRect; coordinateVariant: ImageSelectionConsistency["coordinateVariant"] }> {
+  const results: Array<{ rect: PdfRect; coordinateVariant: ImageSelectionConsistency["coordinateVariant"] }> = [];
   if (Number.isFinite(record.width) && Number.isFinite(record.height) && record.width! > 0 && record.height! > 0) {
-    results.push({ x: record.x, y: record.y, width: record.width!, height: record.height! });
+    addSyncTexRectVariants(results, record.x, record.y, record.width!, record.height!, pageHeight, "xy");
     if (Number.isFinite(record.h) && Number.isFinite(record.v)) {
-      results.push({ x: record.h!, y: record.v!, width: record.width!, height: record.height! });
+      addSyncTexRectVariants(results, record.h!, record.v!, record.width!, record.height!, pageHeight, "hv");
     }
   }
   return results;
 }
 
-function imageRectOverlap(left: import("./types").PdfRect, right: import("./types").PdfRect): number {
+function addSyncTexRectVariants(
+  results: Array<{ rect: PdfRect; coordinateVariant: ImageSelectionConsistency["coordinateVariant"] }>,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  pageHeight: number,
+  coordinateVariant: "xy" | "hv"
+): void {
+  results.push({ rect: { x, y, width, height }, coordinateVariant });
+  results.push({
+    rect: { x, y: pageHeight - y - height, width, height },
+    coordinateVariant: `${coordinateVariant}-flipped` as ImageSelectionConsistency["coordinateVariant"]
+  });
+}
+
+function normalizePdfRect(rect: PdfRect, pageWidth: number, pageHeight: number): PdfRect {
+  return {
+    x: clamp(rect.x / pageWidth, 0, 1),
+    y: clamp(rect.y / pageHeight, 0, 1),
+    width: clamp(rect.width / pageWidth, 0, 1),
+    height: clamp(rect.height / pageHeight, 0, 1)
+  };
+}
+
+function scoreImageRectMatch(left: PdfRect, right: PdfRect): number {
   const width = Math.max(0, Math.min(left.x + left.width, right.x + right.width) - Math.max(left.x, right.x));
   const height = Math.max(0, Math.min(left.y + left.height, right.y + right.height) - Math.max(left.y, right.y));
-  return width * height / Math.max(1, Math.min(left.width * left.height, right.width * right.height));
+  const intersection = width * height;
+  const leftArea = Math.max(0.000001, left.width * left.height);
+  const rightArea = Math.max(0.000001, right.width * right.height);
+  const coverage = intersection / Math.min(leftArea, rightArea);
+  const leftCenter = { x: left.x + left.width / 2, y: left.y + left.height / 2 };
+  const rightCenter = { x: right.x + right.width / 2, y: right.y + right.height / 2 };
+  const centerDistance = Math.hypot(leftCenter.x - rightCenter.x, leftCenter.y - rightCenter.y);
+  const centerScore = Math.max(0, 1 - centerDistance / 0.32);
+  const aspectScore = Math.min(left.width / Math.max(right.width, 0.000001), right.width / Math.max(left.width, 0.000001)) *
+    Math.min(left.height / Math.max(right.height, 0.000001), right.height / Math.max(left.height, 0.000001));
+  return coverage * 0.56 + centerScore * 0.34 + aspectScore * 0.10;
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value));
 }
 
 function enclosingSimpleSubfigure(

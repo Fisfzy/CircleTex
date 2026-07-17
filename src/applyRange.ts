@@ -103,6 +103,10 @@ export function hashNormalizedText(value: string): string {
   return sha256(normalizeLineEndings(value));
 }
 
+export function hasSameNormalizedText(left: string, right: string): boolean {
+  return hashNormalizedText(left) === hashNormalizedText(right);
+}
+
 function normalizeWithOffsetMap(value: string): { text: string; offsets: number[] } {
   let text = "";
   const offsets = [0];
