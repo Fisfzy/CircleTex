@@ -61,6 +61,27 @@ function mappingWithContext(
   return value;
 }
 
+function regionMapping(sourceText: string, selectedText: string, startOffset = 100): SourceMapping {
+  const value = mapping(sourceText, selectedText, startOffset);
+  value.selection = {
+    kind: "region",
+    text: selectedText,
+    page: 2,
+    start: { x: 1, y: 2 },
+    end: { x: 3, y: 4 },
+    bounds: { x: 0.5, y: 1.5, width: 3, height: 3 },
+    anchors: [{ x: 1.2, y: 2.2 }],
+    fragments: [{
+      text: selectedText,
+      start: { x: 1, y: 2 },
+      end: { x: 3, y: 4 },
+      rects: [{ x: 0.8, y: 1.8, width: 2.4, height: 0.5 }],
+      lineIndex: 0
+    }]
+  };
+  return value;
+}
+
 function edit(
   baseText: string,
   id: string,
@@ -463,6 +484,51 @@ describe("新增文字与队列校验", () => {
     );
     assert.equal(complete.structuralFormula, true);
     assert.equal(complete.sourceText, "当$\\sigma_{xx}\\leq 1$时");
+  });
+
+  it("允许区域框选删除完整 equation 环境及其相邻正文", () => {
+    const source = [
+      "前文",
+      "\\begin{equation}",
+      "\\eta_x=0.3529",
+      "\\label{eq:coupling}",
+      "\\end{equation}",
+      "后文"
+    ].join("\n");
+    const complete = createPendingManualEdit(
+      regionMapping(source, "前文ηx=0.3529后文"), "delete", "", rects, "delete-equation-region"
+    );
+    assert.equal(complete.structuralFormula, true);
+    assert.equal(complete.sourceText, source);
+    const base = `${"甲".repeat(100)}${source}`;
+    assert.equal(applyDirectManualEdits(base, [complete]), "甲".repeat(100));
+  });
+
+  it("允许直接删除或替换公式中的唯一数值，但修订模式仍拒绝", () => {
+    const source = "前文$\\eta_x=0.3529$后文";
+    const base = `${"甲".repeat(100)}${source}`;
+    const deletion = createPendingManualEdit(
+      mapping(source, "0.3529"), "delete", "", rects, "delete-formula-number"
+    );
+    assert.equal(deletion.structuredNumeric, true);
+    assert.match(applyDirectManualEdits(base, [deletion]), /\\eta_x=\$后文/);
+    assert.throws(() => applyManualEdits(base, [deletion]), /只支持直接编辑/u);
+
+    const replacement = createPendingManualEdit(
+      mapping(source, "0.3529"), "replace", "2.5%", rects, "replace-formula-number"
+    );
+    assert.equal(replacement.structuredNumeric, true);
+    assert.match(applyDirectManualEdits(base, [replacement]), /\\eta_x=2\.5\\%\$/);
+  });
+
+  it("允许直接删除表格单元格中的唯一数值", () => {
+    const source = "\\begin{tabular}{cc}铺层 & 0.3529 \\\\ \\end{tabular}";
+    const base = `${"甲".repeat(100)}${source}`;
+    const deletion = createPendingManualEdit(
+      mapping(source, "0.3529"), "delete", "", rects, "delete-table-number"
+    );
+    assert.equal(deletion.structuredNumeric, true);
+    assert.match(applyDirectManualEdits(base, [deletion]), /铺层 &  \\\\/);
   });
 
   it("光标删除一次移除完整组合字素或 ZWJ 字素", () => {

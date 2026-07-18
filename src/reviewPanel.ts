@@ -51,14 +51,46 @@ import { SkillTaskService } from "./skillTask";
 import { ImportedSkill, SkillTaskResult } from "./skillTypes";
 import { buildSourceMapping, SyncTexLocator } from "./synctex";
 import { computeLineStarts } from "./textRange";
+import {
+  evaluateTerminologyEdit,
+  proposeTerminologyGates,
+  scanTerminologyForTarget,
+  TerminologyFinding,
+  TerminologyGate,
+  TerminologyGateSnapshot,
+  TerminologyGateStore,
+  TerminologyProposal,
+  TerminologyRevisionConflictError,
+  validateTerminologyProposal
+} from "./terminologyGates";
 import { ProjectPaths, RevisionCandidate, SourceMapping } from "./types";
 
 type WebviewMessage = Record<string, unknown> & { type: string };
 type ManualEditMode = "direct" | "tracked";
 
+interface PendingTerminologyProposal {
+  id: string;
+  requestId: string;
+  baseGateRevision: number;
+  sourceHash: string;
+  proposal: TerminologyProposal;
+}
+
+interface ActiveTerminologyRequest {
+  sequence: number;
+  requestId: string;
+}
+
 export class ReviewPanel implements vscode.Disposable {
   private readonly panel: vscode.WebviewPanel;
   private readonly locator = new SyncTexLocator();
+  private readonly terminologyStore: TerminologyGateStore;
+  private pendingTerminologyProposal?: PendingTerminologyProposal;
+  private terminologyProposalSequence = 0;
+  private activeTerminologyRequest?: ActiveTerminologyRequest;
+  private terminologyMutation?: { token: string; action: string };
+  private terminologyStateSequence = 0;
+  private lastRemovedTerminologyGate?: { gate: TerminologyGate; revision: number };
   private mapping?: SourceMapping;
   private candidate?: RevisionCandidate;
   private previewUri?: vscode.Uri;
@@ -95,6 +127,7 @@ export class ReviewPanel implements vscode.Disposable {
     private readonly skillRegistry: SkillRegistry,
     private readonly skillTaskService: SkillTaskService
   ) {
+    this.terminologyStore = new TerminologyGateStore(project.root);
     this.panel = vscode.window.createWebviewPanel(
       "circletex.pdfReview",
       "CircleTeX PDF 审阅",
@@ -177,6 +210,7 @@ export class ReviewPanel implements vscode.Disposable {
     }
     if (!fromApply && this.pendingManualEdits.length > 0) {
       if (await this.discardStaleManualEditsBeforeCompile()) {
+        await this.refreshTerminologyAfterFailure();
         return;
       }
       try {
@@ -185,6 +219,7 @@ export class ReviewPanel implements vscode.Disposable {
         const message = errorMessage(error);
         this.post({ type: "error", action: "compile", message });
         this.showCompileError(message);
+        await this.refreshTerminologyAfterFailure();
       }
       return;
     }
@@ -196,11 +231,20 @@ export class ReviewPanel implements vscode.Disposable {
       this.invalidateRevisionSession();
       const result = await this.runCompileCore(() => this.ensureSourceSaved());
       this.postCompiled(result.warnings);
-      await this.sendTrackedRevisionState();
+      await Promise.all([this.sendTrackedRevisionState(), this.sendTerminologyState()]);
     } catch (error) {
       const message = errorMessage(error);
       this.post({ type: "error", action: "compile", message });
       this.showCompileError(message);
+      await this.refreshTerminologyAfterFailure();
+    }
+  }
+
+  private async refreshTerminologyAfterFailure(): Promise<void> {
+    try {
+      await this.sendTerminologyState();
+    } catch (error) {
+      this.output.appendLine(`[术语门禁] 编译失败后的规则扫描刷新失败：${errorMessage(error)}`);
     }
   }
 
@@ -275,6 +319,8 @@ export class ReviewPanel implements vscode.Disposable {
     }
     this.disposed = true;
     this.analysisSequence += 1;
+    this.terminologyProposalSequence += 1;
+    this.activeTerminologyRequest = undefined;
     this.activeSkillTask?.controller.abort();
     this.activeSkillTask = undefined;
     if (this.previewUri) {
@@ -317,6 +363,38 @@ export class ReviewPanel implements vscode.Disposable {
       ].includes(value.type)) {
         throw new Error("Skill 任务正在运行，请等待任务完成或先取消任务。");
       }
+      if (this.activeTerminologyRequest && [
+        "analyze",
+        "apply",
+        "compile",
+        "queueManualEdit",
+        "locateImage",
+        "queueImageEdit",
+        "runSkillTask",
+        "applyTerminologyProposal",
+        "removeTerminologyGate",
+        "undoRemoveTerminologyGate",
+        "resolveTrackedRevisions"
+      ].includes(value.type)) {
+        throw new Error("术语门禁草案正在生成，请等待当前请求完成。");
+      }
+      if (this.terminologyMutation && [
+        "analyze",
+        "apply",
+        "compile",
+        "queueManualEdit",
+        "locateImage",
+        "queueImageEdit",
+        "runSkillTask",
+        "proposeTerminologyGates",
+        "applyTerminologyProposal",
+        "discardTerminologyProposal",
+        "removeTerminologyGate",
+        "undoRemoveTerminologyGate",
+        "resolveTrackedRevisions"
+      ].includes(value.type)) {
+        throw new Error(`术语门禁正在${this.terminologyMutation.action}，请等待当前操作完成。`);
+      }
       if (this.applying) {
         throw new Error("正在应用修订，请等待当前操作完成。");
       }
@@ -327,6 +405,7 @@ export class ReviewPanel implements vscode.Disposable {
           this.updateSkills();
           this.sendManualEditsState();
           await this.sendTrackedRevisionState();
+          await this.sendTerminologyState();
           break;
         case "selection":
           await this.mapPdfSelection(value);
@@ -351,6 +430,27 @@ export class ReviewPanel implements vscode.Disposable {
           break;
         case "analyze":
           await this.analyze(value);
+          break;
+        case "proposeTerminologyGates":
+          await this.proposeTerminologyGates(value);
+          break;
+        case "applyTerminologyProposal":
+          await this.applyTerminologyProposal(value);
+          break;
+        case "discardTerminologyProposal":
+          this.discardTerminologyProposal(value);
+          break;
+        case "scanTerminology":
+          await this.sendTerminologyState(undefined, boundedIdentifier(value.requestId, "术语扫描请求"));
+          break;
+        case "removeTerminologyGate":
+          await this.removeTerminologyGate(value);
+          break;
+        case "undoRemoveTerminologyGate":
+          await this.undoRemoveTerminologyGate(value);
+          break;
+        case "openTerminologyFinding":
+          await this.openTerminologyFinding(value);
           break;
         case "runSkillTask":
           await this.runSkillTask(value);
@@ -661,8 +761,8 @@ export class ReviewPanel implements vscode.Disposable {
         edit = createPendingManualEdit(mapping, kind, message.text, rects, undefined, resolvedRange);
       }
     }
-    if (queueMode === "tracked" && edit.structuralFormula) {
-      throw new Error("完整公式结构删除只支持直接编辑模式。请切换为直接编辑后重新框选，或交给 Agent 处理。");
+    if (queueMode === "tracked" && (edit.structuralFormula || edit.structuredNumeric)) {
+      throw new Error("公式、表格及其中的数值仅支持直接编辑模式。请切换为直接编辑后重新框选，或交给 Agent 处理。");
     }
     validateNoOverlappingDocumentEdits([...this.pendingManualEdits, edit]);
     this.pendingManualEditMode ??= queueMode;
@@ -951,6 +1051,8 @@ export class ReviewPanel implements vscode.Disposable {
       if (!this.isCurrentAnalysis(analysisId, sessionId, mapping)) {
         throw new Error("源码范围在分析启动前发生了变化，已取消过期请求。");
       }
+      const terminologySnapshot = await this.terminologyStore.getSnapshot();
+      const assistantInstruction = withTerminologyGateContext(instruction, terminologySnapshot.gates);
       this.post({
         type: "busy",
         action: "analyze",
@@ -964,7 +1066,7 @@ export class ReviewPanel implements vscode.Disposable {
         () => assistant.adapter.generateReplacement(
           this.project.root,
           mapping,
-          instruction,
+          assistantInstruction,
           (text) => this.output.append(text)
         )
       );
@@ -980,6 +1082,16 @@ export class ReviewPanel implements vscode.Disposable {
         throw new Error(`main.tex 在 ${assistant.name} 分析期间发生了变化，已丢弃过期结果。`);
       }
       const replacement = preserveLineEnding(result.replacement, mapping.sourceText);
+      const currentTerminology = await this.terminologyStore.getSnapshot();
+      const terminologyEvaluation = evaluateTerminologyEdit(
+        fullText,
+        { startOffset: mapping.startOffset, endOffset: mapping.endOffset },
+        replacement,
+        currentTerminology.gates
+      );
+      if (terminologyEvaluation.block.length > 0) {
+        throw new Error(`候选修订触发 ${terminologyEvaluation.block.length} 项术语门禁：${formatTerminologyFindings(terminologyEvaluation.block)}。请调整要求后重新生成。`);
+      }
       const candidate: RevisionCandidate = {
         id: randomUUID(),
         mapping: { ...mapping },
@@ -1000,6 +1112,12 @@ export class ReviewPanel implements vscode.Disposable {
         mappingId: candidate.mapping.id,
         summary: candidate.summary
       });
+      if (terminologyEvaluation.warning.length > 0) {
+        this.post({
+          type: "notice",
+          message: `候选修订包含 ${terminologyEvaluation.warning.length} 项术语提醒：${formatTerminologyFindings(terminologyEvaluation.warning)}。请在应用前核对差异。`
+        });
+      }
       await this.openCandidateDiff(candidate, true);
     } catch (error) {
       if (error instanceof AssistantUnavailableError) {
@@ -1025,6 +1143,296 @@ export class ReviewPanel implements vscode.Disposable {
         this.activeAnalysisId = undefined;
       }
     }
+  }
+
+  private async proposeTerminologyGates(message: WebviewMessage): Promise<void> {
+    this.requireTrustedWorkspace();
+    const requestId = boundedIdentifier(message.requestId, "术语门禁草案请求");
+    const instruction = boundedString(message.instruction, 1, 4_000, "全局规则要求");
+    const assistant = createSelectedAssistant();
+    const sequence = ++this.terminologyProposalSequence;
+    if (this.terminologyMutation) {
+      throw new Error(`术语门禁正在${this.terminologyMutation.action}，请等待当前操作完成。`);
+    }
+    const activeRequest: ActiveTerminologyRequest = { sequence, requestId };
+    this.activeTerminologyRequest = activeRequest;
+    this.invalidatePendingTerminologyProposal("正在生成新的术语门禁草案，旧草案已失效。");
+    try {
+      const baseSnapshot = await this.terminologyStore.getSnapshot();
+      this.post({
+        type: "busy",
+        action: "proposeTerminologyGates",
+        requestId,
+        message: `${assistant.name} 正在生成术语门禁草案……`
+      });
+      let proposal: TerminologyProposal;
+      try {
+        const result = assistant.adapter.generateTerminologyProposal
+          ? await assistant.adapter.generateTerminologyProposal(this.project.root, instruction, (text) => this.output.append(text))
+          : undefined;
+        proposal = result ? validateTerminologyProposal(result) : proposeTerminologyGates(instruction);
+      } catch (error) {
+        this.output.appendLine(`[术语门禁] ${assistant.name} 规则草案不可用，已使用本地保守解析：${errorMessage(error)}`);
+        proposal = proposeTerminologyGates(instruction);
+      }
+      if (!this.isCurrentTerminologyRequest(activeRequest)) {
+        return;
+      }
+      const currentSnapshot = await this.terminologyStore.getSnapshot();
+      if (currentSnapshot.revision !== baseSnapshot.revision) {
+        throw new Error("术语门禁在草案生成期间发生了变化，请重新生成草案。");
+      }
+      const source = await fs.readFile(this.project.tex, "utf8");
+      if (!this.isCurrentTerminologyRequest(activeRequest)) {
+        return;
+      }
+      const pending: PendingTerminologyProposal = {
+        id: randomUUID(),
+        requestId,
+        baseGateRevision: currentSnapshot.revision,
+        sourceHash: sha256(source),
+        proposal
+      };
+      this.pendingTerminologyProposal = pending;
+      const scanTarget = terminologyTargetRange(this.mapping, source);
+      this.post({
+        type: "terminologyProposal",
+        requestId,
+        proposalId: pending.id,
+        baseGateRevision: pending.baseGateRevision,
+        gateRevision: currentSnapshot.revision,
+        sourceHash: pending.sourceHash,
+        hasScanTarget: Boolean(scanTarget),
+        proposal,
+        currentFindings: scanTerminologyForTarget(source, currentSnapshot.gates, scanTarget),
+        projectedFindings: scanTerminologyForTarget(source, proposal.operations, scanTarget)
+      });
+    } finally {
+      if (this.activeTerminologyRequest === activeRequest) {
+        this.activeTerminologyRequest = undefined;
+      }
+    }
+  }
+
+  private async applyTerminologyProposal(message: WebviewMessage): Promise<void> {
+    this.requireTrustedWorkspace();
+    const proposalId = boundedIdentifier(message.proposalId, "术语门禁草案");
+    const requestId = boundedIdentifier(message.requestId, "术语门禁草案请求");
+    const expectedRevision = nonNegativeInteger(message.gateRevision, "术语门禁版本");
+    const mutationToken = this.beginTerminologyMutation("启用规则草案");
+    try {
+      const pending = this.pendingTerminologyProposal;
+      if (!pending || pending.id !== proposalId || pending.requestId !== requestId || pending.proposal.operations.length === 0) {
+        throw new Error("当前没有可确认的术语门禁草案。请重新输入明确的规则要求。");
+      }
+      if (expectedRevision !== pending.baseGateRevision) {
+        throw new Error("术语门禁草案的基线版本已变化，请重新生成草案。");
+      }
+      const snapshot = await this.terminologyStore.getSnapshot();
+      if (snapshot.revision !== pending.baseGateRevision) {
+        throw new TerminologyRevisionConflictError(pending.baseGateRevision, snapshot.revision);
+      }
+      if (this.pendingTerminologyProposal !== pending) {
+        throw new Error("术语门禁草案在校验期间发生了变化，请重新生成草案。");
+      }
+      await this.terminologyStore.add(pending.proposal.operations, pending.baseGateRevision);
+      if (this.pendingTerminologyProposal !== pending) {
+        throw new Error("术语门禁草案在写入期间发生了变化，请刷新规则列表。");
+      }
+      this.pendingTerminologyProposal = undefined;
+      this.lastRemovedTerminologyGate = undefined;
+      await this.refreshTerminologyAfterCommit("规则草案已启用");
+      this.post({
+        type: "terminologyProposalApplied",
+        proposalId: pending.id,
+        count: pending.proposal.operations.length
+      });
+    } catch (error) {
+      await this.refreshTerminologyAfterConflict(error);
+      throw error;
+    } finally {
+      this.endTerminologyMutation(mutationToken);
+    }
+  }
+
+  private discardTerminologyProposal(message: WebviewMessage): void {
+    const proposalId = boundedIdentifier(message.proposalId, "术语门禁草案");
+    const requestId = boundedIdentifier(message.requestId, "术语门禁草案请求");
+    const mutationToken = this.beginTerminologyMutation("放弃规则草案");
+    try {
+      const pending = this.pendingTerminologyProposal;
+      if (!pending || pending.id !== proposalId || pending.requestId !== requestId) {
+        throw new Error("术语门禁草案已变化，无法放弃该旧草案。");
+      }
+      this.pendingTerminologyProposal = undefined;
+      this.post({ type: "terminologyProposalDiscarded", proposalId });
+    } finally {
+      this.endTerminologyMutation(mutationToken);
+    }
+  }
+
+  private async removeTerminologyGate(message: WebviewMessage): Promise<void> {
+    this.requireTrustedWorkspace();
+    const id = boundedIdentifier(message.id, "术语门禁");
+    const expectedRevision = nonNegativeInteger(message.gateRevision, "术语门禁版本");
+    const mutationToken = this.beginTerminologyMutation("移除规则");
+    try {
+      const before = await this.terminologyStore.getSnapshot();
+      if (before.revision !== expectedRevision) {
+        throw new TerminologyRevisionConflictError(expectedRevision, before.revision);
+      }
+      const gate = before.gates.find((item) => item.id === id);
+      if (!gate) {
+        throw new Error("待移除的术语门禁已不存在，请刷新后重试。");
+      }
+      await this.terminologyStore.remove(id, expectedRevision);
+      const after = await this.terminologyStore.getSnapshot();
+      this.invalidatePendingTerminologyProposal("术语门禁规则库已变化，旧草案已失效，请重新生成。");
+      this.lastRemovedTerminologyGate = { gate, revision: after.revision };
+      await this.refreshTerminologyAfterCommit("规则已移除", after);
+      this.post({ type: "terminologyGateRemoved", gate, revision: after.revision });
+    } catch (error) {
+      await this.refreshTerminologyAfterConflict(error);
+      throw error;
+    } finally {
+      this.endTerminologyMutation(mutationToken);
+    }
+  }
+
+  private async undoRemoveTerminologyGate(message: WebviewMessage): Promise<void> {
+    this.requireTrustedWorkspace();
+    const id = boundedIdentifier(message.id, "待恢复术语门禁");
+    const expectedRevision = nonNegativeInteger(message.gateRevision, "术语门禁版本");
+    const mutationToken = this.beginTerminologyMutation("恢复规则");
+    try {
+      const removed = this.lastRemovedTerminologyGate;
+      if (!removed || removed.gate.id !== id || removed.revision !== expectedRevision) {
+        throw new Error("术语门禁列表已在删除后变化，无法自动撤销，请重新建立该规则。");
+      }
+      await this.terminologyStore.add([removed.gate], expectedRevision);
+      if (this.lastRemovedTerminologyGate !== removed) {
+        throw new Error("待恢复规则在写入期间发生了变化，请刷新规则列表。");
+      }
+      this.lastRemovedTerminologyGate = undefined;
+      this.invalidatePendingTerminologyProposal("术语门禁规则库已变化，旧草案已失效，请重新生成。");
+      await this.refreshTerminologyAfterCommit("规则已恢复");
+      this.post({ type: "terminologyGateRestored", gateId: id });
+    } catch (error) {
+      await this.refreshTerminologyAfterConflict(error);
+      throw error;
+    } finally {
+      this.endTerminologyMutation(mutationToken);
+    }
+  }
+
+  private async openTerminologyFinding(message: WebviewMessage): Promise<void> {
+    const line = positiveInteger(message.line, "术语命中行号");
+    const expectedRevision = nonNegativeInteger(message.gateRevision, "术语门禁版本");
+    const gateId = boundedIdentifier(message.gateId, "术语门禁");
+    const sourceHash = boundedSha256(message.sourceHash, "术语扫描源码");
+    const snapshot = await this.terminologyStore.getSnapshot();
+    const proposalId = stringValue(message.proposalId);
+    const knownGate = snapshot.gates.some((gate) => gate.id === gateId) || Boolean(
+      proposalId &&
+      this.pendingTerminologyProposal?.id === proposalId &&
+      this.pendingTerminologyProposal.baseGateRevision === expectedRevision &&
+      this.pendingTerminologyProposal.sourceHash === sourceHash &&
+      this.pendingTerminologyProposal.proposal.operations.some((gate) => gate.id === gateId)
+    );
+    if (snapshot.revision !== expectedRevision || !knownGate) {
+      throw new Error("术语扫描结果已过期，请重新扫描全文。");
+    }
+    const document = await vscode.workspace.openTextDocument(this.project.tex);
+    if (sha256(document.getText()) !== sourceHash) {
+      throw new Error("main.tex 已在术语扫描后发生变化，请重新扫描全文。");
+    }
+    if (line > document.lineCount) {
+      throw new Error("术语命中行号已超出当前 main.tex，请重新扫描全文。");
+    }
+    const editor = await vscode.window.showTextDocument(document, vscode.ViewColumn.One, false);
+    const range = document.lineAt(line - 1).range;
+    editor.selection = new vscode.Selection(range.start, range.end);
+    editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+  }
+
+  private async sendTerminologyState(existing?: TerminologyGateSnapshot, requestId?: string): Promise<void> {
+    const sequence = ++this.terminologyStateSequence;
+    const snapshot = existing ?? await this.terminologyStore.getSnapshot();
+    const source = await fs.readFile(this.project.tex, "utf8");
+    if (this.disposed || (sequence !== this.terminologyStateSequence && !requestId)) {
+      return;
+    }
+    if (
+      !this.terminologyMutation &&
+      sequence === this.terminologyStateSequence &&
+      this.pendingTerminologyProposal &&
+      this.pendingTerminologyProposal.baseGateRevision !== snapshot.revision
+    ) {
+      this.invalidatePendingTerminologyProposal("术语门禁规则库已变化，旧草案已失效，请重新生成。");
+    }
+    this.post({
+      type: "terminologyState",
+      stateSequence: sequence,
+      requestId,
+      revision: snapshot.revision,
+      sourceHash: sha256(source),
+      gates: snapshot.gates,
+      findings: scanTerminologyForTarget(source, snapshot.gates, terminologyTargetRange(this.mapping, source))
+    });
+  }
+
+  private isCurrentTerminologyRequest(request: ActiveTerminologyRequest): boolean {
+    return !this.disposed &&
+      this.terminologyProposalSequence === request.sequence &&
+      this.activeTerminologyRequest === request;
+  }
+
+  private beginTerminologyMutation(action: string): string {
+    if (this.activeTerminologyRequest) {
+      throw new Error("术语门禁草案正在生成，请等待当前请求完成。");
+    }
+    if (this.terminologyMutation) {
+      throw new Error(`术语门禁正在${this.terminologyMutation.action}，请勿重复操作。`);
+    }
+    const token = randomUUID();
+    this.terminologyMutation = { token, action };
+    return token;
+  }
+
+  private endTerminologyMutation(token: string): void {
+    if (this.terminologyMutation?.token === token) {
+      this.terminologyMutation = undefined;
+    }
+  }
+
+  private async refreshTerminologyAfterConflict(error: unknown): Promise<void> {
+    if (!(error instanceof TerminologyRevisionConflictError)) return;
+    this.invalidatePendingTerminologyProposal("术语门禁规则库已变化，旧草案已失效，请重新生成。");
+    if (this.lastRemovedTerminologyGate?.revision !== error.actualRevision) {
+      this.lastRemovedTerminologyGate = undefined;
+    }
+    try {
+      await this.sendTerminologyState();
+    } catch (refreshError) {
+      this.output.appendLine(`[术语门禁] 版本冲突后的规则刷新失败：${errorMessage(refreshError)}`);
+    }
+  }
+
+  private async refreshTerminologyAfterCommit(action: string, snapshot?: TerminologyGateSnapshot): Promise<void> {
+    try {
+      await this.sendTerminologyState(snapshot);
+    } catch (error) {
+      const message = `${action}，但当前源码扫描刷新失败：${errorMessage(error)} 请稍后点击“扫描适用范围”。`;
+      this.output.appendLine(`[术语门禁] ${message}`);
+      this.post({ type: "notice", message });
+    }
+  }
+
+  private invalidatePendingTerminologyProposal(message: string): void {
+    const pending = this.pendingTerminologyProposal;
+    if (!pending) return;
+    this.pendingTerminologyProposal = undefined;
+    this.post({ type: "terminologyProposalInvalidated", proposalId: pending.id, message });
   }
 
   private removeManualEdit(message: WebviewMessage): void {
@@ -1247,7 +1655,7 @@ export class ReviewPanel implements vscode.Disposable {
         modeLocked: false
       });
       this.postCompiled(result.warnings);
-      await this.sendTrackedRevisionState();
+      await Promise.all([this.sendTrackedRevisionState(), this.sendTerminologyState()]);
     } finally {
       this.applying = false;
     }
@@ -1327,7 +1735,7 @@ export class ReviewPanel implements vscode.Disposable {
       }
       this.clearManualPreview();
       this.postCompiled(result.warnings);
-      await this.sendTrackedRevisionState();
+      await Promise.all([this.sendTrackedRevisionState(), this.sendTerminologyState()]);
     } catch (error) {
       this.showCompileError(errorMessage(error));
       throw error;
@@ -1439,7 +1847,7 @@ export class ReviewPanel implements vscode.Disposable {
         ? `${baseMessage} main.tex 已恢复，待提交修订仍保留。`
         : `${baseMessage} 未自动覆盖当前源码，请使用备份核对：${backupPath}`;
       this.sendManualEditsState();
-      await this.sendTrackedRevisionState().catch(() => undefined);
+      await Promise.allSettled([this.sendTrackedRevisionState(), this.sendTerminologyState()]);
       throw new Error(message);
     }
   }
@@ -1499,15 +1907,28 @@ export class ReviewPanel implements vscode.Disposable {
         return;
       }
 
+      const terminologySnapshot = await this.terminologyStore.getSnapshot();
+      const terminologyEvaluation = evaluateTerminologyEdit(
+        currentText,
+        { startOffset: editorRange.startOffset, endOffset: editorRange.endOffset },
+        candidate.replacement,
+        terminologySnapshot.gates
+      );
+      if (terminologyEvaluation.block.length > 0) {
+        throw new Error(`修订建议不符合当前最新术语门禁：${formatTerminologyFindings(terminologyEvaluation.block)}。规则可能在建议生成后发生了变化，请重新生成建议。`);
+      }
+
       const version = document.version;
       const diskHash = sha256(diskText);
       const backupPath = await createTexBackup(this.project.root, diskText);
       const diskTextAfterBackup = await fs.readFile(this.project.tex, "utf8");
+      const terminologyAfterBackup = await this.terminologyStore.getSnapshot();
       if (
         document.version !== version ||
         document.isDirty ||
         this.disposed ||
         sha256(diskTextAfterBackup) !== diskHash ||
+        terminologyAfterBackup.revision !== terminologySnapshot.revision ||
         this.candidate !== candidate ||
         this.sessionId !== message.sessionId ||
         this.mapping?.id !== candidate.mapping.id
@@ -1549,6 +1970,12 @@ export class ReviewPanel implements vscode.Disposable {
       }
       this.output.appendLine(`已应用局部修订，备份：${backupPath}`);
       this.post({ type: "applied", backupPath });
+      if (terminologyEvaluation.warning.length > 0) {
+        this.post({
+          type: "notice",
+          message: `已应用修订，但仍有 ${terminologyEvaluation.warning.length} 项术语提醒：${formatTerminologyFindings(terminologyEvaluation.warning)}。`
+        });
+      }
       this.clearCandidate();
       if (this.redoManualEdits.length > 0) {
         this.redoManualEdits.splice(0);
@@ -1561,6 +1988,7 @@ export class ReviewPanel implements vscode.Disposable {
       if (autoCompile) {
         await this.compileAndRefresh(true);
       }
+      await this.sendTerminologyState();
     } finally {
       this.applying = false;
     }
@@ -2135,6 +2563,41 @@ function lineNumberAtOffset(lineStarts: number[], offset: number): number {
   return Math.max(1, high + 1);
 }
 
+function withTerminologyGateContext(instruction: string, gates: readonly TerminologyGate[]): string {
+  const enabled = gates.filter((gate) => gate.enabled).map((gate) => ({
+    kind: gate.kind,
+    preferred: gate.preferred,
+    forbidden: gate.forbidden,
+    scope: gate.scope,
+    severity: gate.severity
+  }));
+  if (enabled.length === 0) {
+    return instruction;
+  }
+  const payload = JSON.stringify({ terminologyGates: enabled });
+  if (payload.length > 64_000) {
+    throw new Error("已启用的术语门禁上下文超过 64000 个字符，请精简重复规则后再请求 AI 修订。");
+  }
+  return `${instruction}\n\n以下是用户已确认的 CircleTeX 术语门禁。生成内容必须遵守硬性门禁，并主动核对提醒项；不得改写或忽略这些规则。\n${payload}`;
+}
+
+function terminologyTargetRange(mapping: SourceMapping | undefined, source: string): { startOffset: number; endOffset: number } | undefined {
+  if (
+    !mapping ||
+    sha256(source) !== mapping.documentHash ||
+    mapping.startOffset < 0 ||
+    mapping.endOffset < mapping.startOffset ||
+    mapping.endOffset > source.length
+  ) {
+    return undefined;
+  }
+  return { startOffset: mapping.startOffset, endOffset: mapping.endOffset };
+}
+
+function formatTerminologyFindings(findings: readonly TerminologyFinding[]): string {
+  return findings.slice(0, 3).map((item) => `第 ${item.line} 行“${item.term}”`).join("、");
+}
+
 async function createTexBackup(projectRoot: string, content: string): Promise<string> {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const directory = path.join(projectRoot, "backup", "circletex");
@@ -2243,7 +2706,8 @@ function manualEditForWebview(edit: PendingDocumentEdit): Record<string, unknown
     page: edit.page,
     rects: edit.rects,
     insertedText: edit.insertedText,
-    ...(edit.structuralFormula ? { structuralFormula: true } : {})
+    ...(edit.structuralFormula ? { structuralFormula: true } : {}),
+    ...(edit.structuredNumeric ? { structuredNumeric: true } : {})
   };
 }
 
@@ -2335,6 +2799,13 @@ function boundedString(value: unknown, minimum: number, maximum: number, name: s
 function boundedIdentifier(value: unknown, name: string): string {
   if (typeof value !== "string" || value.length < 1 || value.length > 128 || !/^[A-Za-z0-9_-]+$/.test(value)) {
     throw new Error(`${name}标识无效。`);
+  }
+  return value;
+}
+
+function boundedSha256(value: unknown, name: string): string {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/u.test(value)) {
+    throw new Error(`${name}哈希无效。`);
   }
   return value;
 }

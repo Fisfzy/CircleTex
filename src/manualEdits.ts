@@ -34,6 +34,7 @@ export interface PendingManualEdit {
   rects: NormalizedManualEditRect[];
   baseDocumentHash: string;
   structuralFormula?: boolean;
+  structuredNumeric?: boolean;
 }
 
 export interface ManualEditSourceRange {
@@ -335,6 +336,7 @@ export function createPendingManualEdit(
   }
   const normalizedRects = validateManualEditRects(rects);
   let structuralFormula = false;
+  let structuredNumeric = false;
   let range: ManualEditSourceRange;
   if (resolvedRange) {
     range = validateResolvedManualEditRange(mapping, resolvedRange);
@@ -342,15 +344,24 @@ export function createPendingManualEdit(
     try {
       range = resolveManualEditSourceRange(mapping);
     } catch (error) {
-      if (error instanceof ManualEditAmbiguityError || kind !== "delete") {
+      if (error instanceof ManualEditAmbiguityError || (kind !== "delete" && kind !== "replace")) {
         throw error;
       }
-      range = resolveCompleteFormulaDeletionRange(mapping);
-      structuralFormula = true;
+      try {
+        if (kind !== "delete") throw error;
+        range = resolveCompleteFormulaDeletionRange(mapping);
+        structuralFormula = true;
+      } catch (formulaError) {
+        try {
+          range = resolveStructuredNumericRange(mapping);
+          structuredNumeric = true;
+        } catch {
+          throw formulaError;
+        }
+      }
     }
   }
-  validateInsertedTextForKind(kind, insertedText);
-  return {
+  const edit: PendingManualEdit = {
     id,
     kind,
     ...range,
@@ -358,8 +369,11 @@ export function createPendingManualEdit(
     page: mapping.selection.page,
     rects: normalizedRects,
     baseDocumentHash: mapping.documentHash,
-    ...(structuralFormula ? { structuralFormula: true } : {})
+    ...(structuralFormula ? { structuralFormula: true } : {}),
+    ...(structuredNumeric ? { structuredNumeric: true } : {})
   };
+  validateEditInsertionText(edit);
+  return edit;
 }
 
 interface StructuredVisibleToken {
@@ -379,9 +393,6 @@ interface StructuredFormulaGroup {
  * 并将整个数学结构作为一个原子源码范围删除。
  */
 function resolveCompleteFormulaDeletionRange(mapping: SourceMapping): ManualEditSourceRange {
-  if (mapping.selection.kind !== "text") {
-    throw new Error("包含公式的区域请选择完整公式与相邻正文，当前区域无法安全建立结构化删除范围。");
-  }
   const selected = collapseVisibleText(mapping.selection.text).graphemes;
   if (selected.length === 0) {
     throw new Error("PDF 选区不包含可删除的文字或完整公式。");
@@ -417,7 +428,47 @@ function resolveCompleteFormulaDeletionRange(mapping: SourceMapping): ManualEdit
   if (unique.length > 1) {
     throw new Error("所选公式在映射源码中存在多个结构化候选，无法安全确定删除位置。请缩小选区或交给 Agent 处理。");
   }
-  throw new Error("选区包含公式或 LaTeX 符号，但未完整覆盖可安全删除的公式结构。请框选完整公式及需要删除的正文，或交给 Agent 处理。");
+  throw new Error("选区包含公式或 LaTeX 符号，但未完整覆盖可安全删除的公式或表格结构。请框选完整结构及需要删除的正文，或交给 Agent 处理。");
+}
+
+const STRUCTURED_NUMERIC_SOURCE_RE = /[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?(?:\\%)?/gu;
+const STRUCTURED_NUMERIC_VISIBLE_RE = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?%?$/u;
+
+/**
+ * 数学环境和表格中的数字不能按普通正文修改。只接受完整的单个数值，
+ * 并要求在当前 SyncTeX 源码窗口内唯一命中，避免在重复数据中猜测位置。
+ */
+function resolveStructuredNumericRange(mapping: SourceMapping): ManualEditSourceRange {
+  const selected = normalizeStructuredNumericVisible(mapping.selection.text);
+  if (!STRUCTURED_NUMERIC_VISIBLE_RE.test(selected)) {
+    throw new Error("选区不是可安全修改的单个数值。公式请框选完整公式，表格请框选完整单元格数值。");
+  }
+  const projection = projectLatexSource(mapping.sourceText);
+  const candidates: ManualEditSourceRange[] = [];
+  for (const match of mapping.sourceText.matchAll(STRUCTURED_NUMERIC_SOURCE_RE)) {
+    if (match.index === undefined || normalizeStructuredNumericVisible(match[0]) !== selected) continue;
+    const localStart = match.index;
+    const localEnd = localStart + match[0].length;
+    if (!isGraphemeBoundary(mapping.sourceText, localStart) || !isGraphemeBoundary(mapping.sourceText, localEnd)) continue;
+    const insideProtectedStructure = projection.opaqueSpans.some((span) =>
+      span.kind === "math" && span.start <= localStart && span.end >= localEnd
+    );
+    if (!insideProtectedStructure) continue;
+    candidates.push({
+      startOffset: mapping.startOffset + localStart,
+      endOffset: mapping.startOffset + localEnd,
+      sourceText: match[0]
+    });
+  }
+  if (candidates.length === 1) return candidates[0];
+  if (candidates.length > 1) {
+    throw new Error("所选数值在当前源码范围内有多个候选，无法安全确定修改位置。请缩小选区或直接编辑源码。");
+  }
+  throw new Error("未能在公式或表格结构中定位所选数值。请框选完整公式或表格单元格，或直接编辑源码。");
+}
+
+function normalizeStructuredNumericVisible(value: string): string {
+  return collapseVisibleText(value).text.replace(/[−–]/gu, "-");
 }
 
 function structuredVisibleTokens(source: string): {
@@ -459,6 +510,11 @@ function mathToVisibleText(value: string): string {
     .replace(/^\$\$?|\$\$?$/gu, "")
     .replace(/^\\\(|\\\)$/gu, "")
     .replace(/^\\\[|\\\]$/gu, "");
+  result = result
+    .replace(/\\(?:begin|end)\s*\{[^{}]*\}/gu, "")
+    .replace(/\\(?:label|tag\*?|nonumber|notag)\s*(?:\{[^{}]*\})?/gu, "")
+    .replace(/\\\\(?:\[[^\]]*\])?/gu, "")
+    .replace(/&/gu, "");
   for (let pass = 0; pass < 6; pass += 1) {
     const previous = result;
     result = result
@@ -721,7 +777,9 @@ export function applyDirectManualEdits(
     replacements.push({
       startOffset: edit.startOffset,
       endOffset: edit.endOffset,
-      replacement: edit.kind === "replace" ? escapeLatexPlainText(edit.insertedText) : ""
+      replacement: edit.kind === "replace"
+        ? edit.structuredNumeric ? renderStructuredNumericReplacement(edit.insertedText) : escapeLatexPlainText(edit.insertedText)
+        : ""
     });
   }
 
@@ -757,8 +815,8 @@ export function applyManualEdits(baseText: string, edits: readonly PendingManual
   validateNoOverlappingManualEdits(edits);
   const documentHash = hashDocument(baseText);
   for (const edit of edits) {
-    if (edit.structuralFormula) {
-      throw new Error("完整公式结构删除只支持直接编辑模式，不能生成修订痕迹。");
+    if (edit.structuralFormula || edit.structuredNumeric) {
+      throw new Error("公式、表格和其中的数值只支持直接编辑模式，不能生成修订痕迹。");
     }
     if (edit.baseDocumentHash !== documentHash) {
       throw new Error(`手动修订 ${edit.id} 的基线源码校验失败。`);
@@ -771,8 +829,8 @@ export function applyManualEdits(baseText: string, edits: readonly PendingManual
     }
     if (edit.startOffset === edit.endOffset) {
       validateOrdinaryInsertionPoint(baseText, edit.startOffset);
-    } else validateOrdinarySourceFragment(baseText, edit.startOffset, edit.sourceText);
-    validateInsertedTextForKind(edit.kind, edit.insertedText);
+    } else validateManualEditTarget(baseText, edit);
+    validateEditInsertionText(edit);
   }
 
   const ordered = edits.map((edit, queueIndex) => ({ edit, queueIndex })).sort((left, right) => {
@@ -905,7 +963,7 @@ function validateDirectManualEditBatch(
     if (edit.startOffset === edit.endOffset) {
       validateOrdinaryInsertionPoint(baseText, edit.startOffset);
     } else validateManualEditTarget(baseText, edit);
-    validateInsertedTextForKind(edit.kind, edit.insertedText);
+    validateEditInsertionText(edit);
     if (edit.kind === "delete" || edit.kind === "replace") {
       destructiveRanges.push({
         startOffset: edit.startOffset,
@@ -968,6 +1026,34 @@ function validateInsertedTextForKind(kind: ManualEditKind, insertedText: string)
   validatePlainText(insertedText);
 }
 
+function validateEditInsertionText(edit: PendingManualEdit): void {
+  if (!edit.structuredNumeric) {
+    validateInsertedTextForKind(edit.kind, edit.insertedText);
+    return;
+  }
+  if (edit.kind === "delete") {
+    if (edit.insertedText.length !== 0) {
+      throw new Error("数值删除不能同时包含替换内容。");
+    }
+    return;
+  }
+  if (edit.kind !== "replace") {
+    throw new Error("公式或表格中的数值仅支持删除或替换。");
+  }
+  const replacement = normalizeStructuredNumericVisible(edit.insertedText);
+  if (!STRUCTURED_NUMERIC_VISIBLE_RE.test(replacement)) {
+    throw new Error("公式或表格中的数值替换内容必须是单个数值，可选带百分号。");
+  }
+}
+
+function renderStructuredNumericReplacement(value: string): string {
+  const normalized = normalizeStructuredNumericVisible(value);
+  if (!STRUCTURED_NUMERIC_VISIBLE_RE.test(normalized)) {
+    throw new Error("数值替换内容无效。");
+  }
+  return normalized.replace(/%/gu, "\\%");
+}
+
 function validatePlainText(value: string): void {
   if (typeof value !== "string" || value.length === 0 || value.trim().length === 0) {
     throw new Error("新增或替换文字不能为空。");
@@ -1007,14 +1093,28 @@ function validatePendingEditShape(edit: PendingManualEdit): void {
   if (edit.structuralFormula !== undefined && edit.structuralFormula !== true) {
     throw new Error(`手动修订 ${edit.id} 的公式结构标记无效。`);
   }
+  if (edit.structuredNumeric !== undefined && edit.structuredNumeric !== true) {
+    throw new Error(`手动修订 ${edit.id} 的数值结构标记无效。`);
+  }
+  if (edit.structuralFormula && edit.structuredNumeric) {
+    throw new Error(`手动修订 ${edit.id} 不能同时标记为公式和数值结构。`);
+  }
   if (edit.structuralFormula && (edit.kind !== "delete" || edit.insertedText.length > 0 || edit.endOffset <= edit.startOffset)) {
     throw new Error(`手动修订 ${edit.id} 的公式结构删除类型无效。`);
+  }
+  if (edit.structuredNumeric && (
+    (edit.kind !== "delete" && edit.kind !== "replace") ||
+    edit.endOffset <= edit.startOffset
+  )) {
+    throw new Error(`手动修订 ${edit.id} 的数值结构编辑类型无效。`);
   }
 }
 
 function validateManualEditTarget(baseText: string, edit: PendingManualEdit): void {
   if (edit.structuralFormula) {
     validateCompleteFormulaSourceFragment(baseText, edit.startOffset, edit.sourceText);
+  } else if (edit.structuredNumeric) {
+    validateStructuredNumericSourceFragment(baseText, edit.startOffset, edit.sourceText);
   } else {
     validateOrdinarySourceFragment(baseText, edit.startOffset, edit.sourceText);
   }
@@ -1036,6 +1136,30 @@ function validateCompleteFormulaSourceFragment(windowText: string, localStart: n
   ) {
     throw new Error("完整公式结构删除必须完整覆盖公式，且不能包含引用、命令或其他受限结构。");
   }
+}
+
+function validateStructuredNumericSourceFragment(windowText: string, localStart: number, fragment: string): void {
+  const localEnd = localStart + fragment.length;
+  if (
+    fragment.length === 0 ||
+    !isGraphemeBoundary(windowText, localStart) ||
+    !isGraphemeBoundary(windowText, localEnd) ||
+    !isStructuredNumericSource(fragment) ||
+    UNSAFE_TEXT_CONTROLS.test(fragment)
+  ) {
+    throw new Error("公式或表格中的数值范围无效。");
+  }
+  const projection = projectLatexSource(windowText);
+  if (!projection.opaqueSpans.some((span) =>
+    span.kind === "math" && span.start <= localStart && span.end >= localEnd
+  )) {
+    throw new Error("数值编辑必须位于公式或表格结构中。");
+  }
+}
+
+function isStructuredNumericSource(value: string): boolean {
+  const matches = [...value.matchAll(STRUCTURED_NUMERIC_SOURCE_RE)];
+  return matches.length === 1 && matches[0][0] === value;
 }
 
 function validateOrdinaryInsertionPoint(source: string, offset: number): void {

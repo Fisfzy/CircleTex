@@ -355,6 +355,16 @@ try {
   assert.deepEqual(startupPreviewEvents.map((event) => event.type), ["shown", "immediateRemoved", "snapshotRemoved"]);
   assert.equal(startupPreviewEvents[0].pageShells, 0, "缓存预览必须先于 PDF 页面壳体显示。");
   assert.equal(await page.locator(".startup-preview-overlay, .page-refresh-snapshot").count(), 0, "高清 Canvas 完成后必须移除缓存预览。");
+  await page.evaluate(() => {
+    window.dispatchEvent(new MessageEvent("message", { data: { type: "compiled", token: 1, warnings: [] } }));
+    window.dispatchEvent(new MessageEvent("message", { data: { type: "compiled", token: 2, warnings: [] } }));
+  });
+  await page.waitForFunction(() =>
+    document.getElementById("loading").hidden &&
+    document.getElementById("status").textContent.includes("PDF 已刷新")
+  , undefined, { timeout: 15_000 });
+  assert.doesNotMatch(await page.locator("#status").textContent(), /失败|aborted|destroyed/iu);
+  await page.waitForFunction(() => document.getElementById("compile-progress").hidden, undefined, { timeout: 5_000 });
   await page.waitForFunction(() => window.__messages.some((message) =>
     message.type === "cachePdfPreview" &&
     typeof message.dataUrl === "string" &&
@@ -369,6 +379,129 @@ try {
   })));
   assert.equal(await page.locator("#analyze").textContent(), "交给 Snow CLI 分析");
   assert.equal(await page.locator("#manual-handoff").textContent(), "复制任务并打开 Snow CLI");
+  const terminologyGate = {
+    id: "gate_smoke_current",
+    kind: "preferredTerm",
+    preferred: "近场动力学微分算子",
+    forbidden: ["近场动力学算子"],
+    scope: "document",
+    severity: "block",
+    enabled: true,
+    source: "烟测",
+    createdAt: "2026-07-18T00:00:00.000Z"
+  };
+  const proposedGate = {
+    ...terminologyGate,
+    id: "gate_smoke_proposed",
+    kind: "phraseRule",
+    preferred: "结果表明",
+    forbidden: ["不难发现"],
+    severity: "warning"
+  };
+  const terminologySourceHash = "a".repeat(64);
+  await page.evaluate(({ terminologyGate, terminologySourceHash }) => {
+    window.dispatchEvent(new MessageEvent("message", { data: {
+      type: "skillsChanged",
+      skills: [{ id: "tex-to-mathtype-word", name: "无底稿 MathType Word 导出", scope: "document", taskType: "artifact" }]
+    } }));
+    window.dispatchEvent(new MessageEvent("message", { data: {
+      type: "terminologyState",
+      revision: 3,
+      sourceHash: terminologySourceHash,
+      gates: [terminologyGate],
+      findings: [{ gateId: terminologyGate.id, kind: terminologyGate.kind, code: "forbidden-term", severity: "block", line: 12, term: terminologyGate.forbidden[0], context: "命中上下文", message: "术语不符合门禁" }]
+    } }));
+  }, { terminologyGate, terminologySourceHash });
+  assert.equal(await page.locator("#terminology-badge").textContent(), "1");
+  await page.locator("#dock-toggle").click();
+  await page.waitForFunction(() => document.documentElement.classList.contains("dock-collapsed"));
+  await page.locator("#terminology-gates").click();
+  await page.waitForFunction(() => !document.documentElement.classList.contains("dock-collapsed"));
+  assert.equal(await page.locator("#terminology-panel").isVisible(), true);
+  assert.equal(await page.locator("#terminology-gates").getAttribute("aria-expanded"), "true");
+  await page.waitForFunction(() => window.__messages.some((message) => message.type === "scanTerminology"));
+  await page.evaluate(({ terminologyGate, terminologySourceHash }) => window.dispatchEvent(new MessageEvent("message", { data: {
+    type: "terminologyState",
+    revision: 3,
+    sourceHash: terminologySourceHash,
+    gates: [terminologyGate],
+    findings: []
+  } })), { terminologyGate, terminologySourceHash });
+  assert.equal(await page.locator("#terminology-scan").isEnabled(), true, "自动重扫覆盖显式扫描时不能遗留永久忙碌态。");
+  await page.locator("#task-mode").selectOption("terminology");
+  await page.locator("#instruction").fill("全文统一使用规范术语。");
+  await page.locator("#analyze").click();
+  assert.equal(await page.locator("#compile").isDisabled(), true);
+  const terminologyProposalRequest = await page.evaluate(() => window.__messages.findLast((message) => message.type === "proposeTerminologyGates"));
+  await page.evaluate(({ requestId, proposedGate, terminologySourceHash }) => window.dispatchEvent(new MessageEvent("message", { data: {
+    type: "terminologyProposal",
+    requestId,
+    proposalId: "proposal_smoke",
+    baseGateRevision: 3,
+    gateRevision: 3,
+    sourceHash: terminologySourceHash,
+    proposal: { intent: "术语烟测", operations: [proposedGate], note: "确认后启用" },
+    currentFindings: [],
+    projectedFindings: [{ gateId: proposedGate.id, kind: proposedGate.kind, code: "forbidden-term", severity: "warning", line: 20, term: proposedGate.forbidden[0], context: "预计命中", message: "措辞提醒" }]
+  } })), { requestId: terminologyProposalRequest.requestId, proposedGate, terminologySourceHash });
+  assert.equal(await page.locator("#terminology-proposal").isVisible(), true);
+  assert.equal(await page.locator("#terminology-projected-findings .terminology-finding-link").count(), 1);
+  const refreshedTerminologySourceHash = "b".repeat(64);
+  await page.evaluate(({ terminologyGate, refreshedTerminologySourceHash }) => window.dispatchEvent(new MessageEvent("message", { data: {
+    type: "terminologyState",
+    revision: 3,
+    sourceHash: refreshedTerminologySourceHash,
+    gates: [terminologyGate],
+    findings: []
+  } })), { terminologyGate, refreshedTerminologySourceHash });
+  await page.locator("#terminology-projected-findings .terminology-finding-link").click();
+  const openFinding = await page.evaluate(() => window.__messages.findLast((message) => message.type === "openTerminologyFinding"));
+  assert.equal(openFinding.sourceHash, terminologySourceHash, "草案预计命中必须保留生成时的源码哈希。");
+  assert.equal(openFinding.proposalId, "proposal_smoke");
+  assert.equal(openFinding.gateRevision, 3);
+  await page.locator("#dock-toggle").click();
+  await page.waitForFunction(() => document.documentElement.classList.contains("dock-collapsed"));
+  assert.match(await page.locator("#dock-collapsed-progress-label").textContent(), /待确认术语门禁/u);
+  await page.keyboard.press("Control+Enter");
+  const applyTerminology = await page.evaluate(() => window.__messages.findLast((message) => message.type === "applyTerminologyProposal"));
+  assert.equal(applyTerminology.proposalId, "proposal_smoke");
+  assert.equal(applyTerminology.gateRevision, 3);
+  await page.evaluate(({ terminologyGate, proposedGate, terminologySourceHash }) => {
+    window.dispatchEvent(new MessageEvent("message", { data: {
+      type: "terminologyState", revision: 4, sourceHash: terminologySourceHash, gates: [terminologyGate, proposedGate], findings: []
+    } }));
+    window.dispatchEvent(new MessageEvent("message", { data: {
+      type: "terminologyProposalApplied", proposalId: "proposal_smoke", count: 1
+    } }));
+  }, { terminologyGate, proposedGate, terminologySourceHash });
+  await page.locator("#terminology-gates").click();
+  await page.waitForFunction(() => !document.documentElement.classList.contains("dock-collapsed"));
+  await page.evaluate(({ terminologyGate, proposedGate, terminologySourceHash }) => window.dispatchEvent(new MessageEvent("message", { data: {
+    type: "terminologyState", revision: 4, sourceHash: terminologySourceHash, gates: [terminologyGate, proposedGate], findings: []
+  } })), { terminologyGate, proposedGate, terminologySourceHash });
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.locator("#terminology-gate-list .icon-button").first().click();
+  const removeTerminology = await page.evaluate(() => window.__messages.findLast((message) => message.type === "removeTerminologyGate"));
+  assert.equal(removeTerminology.gateRevision, 4);
+  await page.evaluate(({ terminologyGate, proposedGate, terminologySourceHash }) => {
+    window.dispatchEvent(new MessageEvent("message", { data: {
+      type: "terminologyState", revision: 5, sourceHash: terminologySourceHash, gates: [proposedGate], findings: []
+    } }));
+    window.dispatchEvent(new MessageEvent("message", { data: {
+      type: "terminologyGateRemoved", gate: terminologyGate, revision: 5
+    } }));
+  }, { terminologyGate, proposedGate, terminologySourceHash });
+  await page.locator("#terminology-undo button").click();
+  const undoTerminology = await page.evaluate(() => window.__messages.findLast((message) => message.type === "undoRemoveTerminologyGate"));
+  assert.equal(undoTerminology.gateRevision, 5);
+  await page.evaluate(({ terminologyGate, proposedGate, terminologySourceHash }) => {
+    window.dispatchEvent(new MessageEvent("message", { data: {
+      type: "terminologyState", revision: 6, sourceHash: terminologySourceHash, gates: [terminologyGate, proposedGate], findings: []
+    } }));
+    window.dispatchEvent(new MessageEvent("message", { data: { type: "terminologyGateRestored", gateId: terminologyGate.id } }));
+  }, { terminologyGate, proposedGate, terminologySourceHash });
+  assert.equal(await page.locator("#terminology-undo").isHidden(), true);
+  await page.locator("#terminology-gates").click();
   assert.equal(await page.locator("#interaction-mode").count(), 1);
   assert.equal(await page.locator("#mode-agent").getAttribute("aria-pressed"), "true");
   assert.equal(await page.locator("#mode-direct").getAttribute("aria-pressed"), "false");
@@ -886,7 +1019,8 @@ try {
   assert.equal(reloadAnchorAfter.page, reloadAnchorBefore.page);
   assert.ok(Math.abs(reloadAnchorAfter.xRatio - reloadAnchorBefore.xRatio) < 0.03);
   assert.ok(Math.abs(reloadAnchorAfter.yRatio - reloadAnchorBefore.yRatio) < 0.03);
-  assert.ok((await page.locator(".pdf-page canvas").count()) <= 3);
+  // 普通缩放下 viewer.js 的渲染预算为 5 页；高缩放时才收缩为 3 页。
+  assert.ok((await page.locator(".pdf-page canvas").count()) <= 5);
   assert.equal(await page.locator(".manual-edit-overlay").count(), 1);
   assert.equal(await page.locator("#compile").textContent(), "应用 3 项并编译");
 
@@ -1143,16 +1277,17 @@ try {
   const directEdits = [];
   await page.locator("#region-select").click();
   assert.equal(await page.locator("#region-select").getAttribute("aria-pressed"), "true");
-  await page.locator("#page-number").fill("9");
+  await page.locator("#page-number").fill("10");
   await page.locator("#page-number").press("Enter");
-  await page.waitForFunction(() => Number(document.querySelector('.pdf-page[data-page-number="9"]')?.dataset.imageCount) >= 1);
-  const imageBox = await page.locator('.pdf-page[data-page-number="9"]').evaluate((shell) => {
+  await page.locator("#page-number").evaluate((input) => input.dispatchEvent(new Event("change", { bubbles: true })));
+  await page.waitForFunction(() => Number(document.querySelector('.pdf-page[data-page-number="10"]')?.dataset.imageCount) >= 1);
+  const imageBox = await page.locator('.pdf-page[data-page-number="10"]').evaluate((shell) => {
     const boundary = JSON.parse(shell.dataset.imageBoundaries)[0];
     const shellRect = shell.getBoundingClientRect();
     const scaleX = shellRect.width / Number.parseFloat(shell.style.width) * (Number.parseFloat(shell.style.width) / 595.28);
     const scaleY = shellRect.height / Number.parseFloat(shell.style.height) * (Number.parseFloat(shell.style.height) / 841.89);
     return {
-      page: 9,
+      page: 10,
       left: shellRect.left + (boundary.x + boundary.width * 0.1) * scaleX,
       right: shellRect.left + (boundary.x + boundary.width * 0.9) * scaleX,
       top: shellRect.top + (boundary.y + boundary.height * 0.1) * scaleY,
@@ -1602,7 +1737,7 @@ try {
   });
   assert.equal(await page.locator("#compile-progress").getAttribute("data-kind"), "error");
   assert.equal(await page.locator("#compile-progress-label").textContent(), "编译失败，请查看错误信息");
-  console.log("连续 PDF Webview 烟测通过：直接键盘编辑、输入法、撤销重做、手动编辑、滚轮缩放、区域框选和编译刷新正常。");
+  console.log("连续 PDF Webview 烟测通过：术语门禁、快速刷新、直接编辑、撤销重做、区域框选和编译状态正常。");
 } finally {
   await browser.close();
   await new Promise((resolve) => server.close(resolve));

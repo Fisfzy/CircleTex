@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { LatexCompiler, latexLogRequiresAnotherPass, publishBuild } from "../compiler";
+import { findExecutable } from "../processRunner";
 
 describe("编译产物发布事务", () => {
   it("只把明确的 LaTeX 重跑警告判定为需要下一遍", () => {
@@ -12,9 +13,15 @@ describe("编译产物发布事务", () => {
     assert.equal(latexLogRequiresAnotherPass("LaTeX Warning: Label(s) may have changed. Rerun to get cross-references right."), true);
     assert.equal(latexLogRequiresAnotherPass("LaTeX Warning: There were undefined references."), true);
     assert.equal(latexLogRequiresAnotherPass("Package rerunfilecheck Warning: File `main.out' has changed."), true);
+    assert.equal(latexLogRequiresAnotherPass("Package biblatex Warning: Please (re)run Biber on the file:"), true);
+    assert.equal(latexLogRequiresAnotherPass("Package longtable Warning: Table widths have changed. Rerun LaTeX."), true);
   });
 
-  it("辅助文件稳定且日志无重跑要求时安全省略默认第二遍", async () => {
+  it("完整辅助文件稳定且日志无重跑要求时安全省略默认第二遍", async (context) => {
+    if (!(await findExecutable("xelatex"))) {
+      context.skip("当前环境未安装 XeLaTeX，跳过编译集成检查。");
+      return;
+    }
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "circletex-convergence-test-"));
     try {
       const sourcePath = path.join(root, "main.tex");
@@ -24,11 +31,22 @@ describe("编译产物发布事务", () => {
         pdf: path.join(root, "main.pdf"),
         syncTex: path.join(root, "main.synctex.gz")
       };
-      await fs.writeFile(sourcePath, "\\documentclass{article}\n\\begin{document}\nFirst version.\n\\end{document}\n");
+      const source = (version: string) => [
+        "\\documentclass{article}",
+        "\\begin{document}",
+        "\\listoffigures",
+        `Text ${version}.`,
+        "\\begin{figure}",
+        "\\caption{Stable caption}",
+        "\\end{figure}",
+        "\\end{document}",
+        ""
+      ].join("\n");
+      await fs.writeFile(sourcePath, source("one"));
       const first = await new LatexCompiler().compile(project, 2, () => undefined);
       assert.equal(first.passes, 2);
 
-      await fs.writeFile(sourcePath, "\\documentclass{article}\n\\begin{document}\nSecond version.\n\\end{document}\n");
+      await fs.writeFile(sourcePath, source("two"));
       let output = "";
       const progressEvents: Array<{ percent: number; message: string; indeterminate?: boolean }> = [];
       const second = await new LatexCompiler().compile(project, 2, (text) => {
@@ -38,6 +56,10 @@ describe("编译产物发布事务", () => {
       assert.match(output, /安全省略第 2 遍 XeLaTeX/);
       assert.deepEqual(progressEvents.map((progress) => progress.percent), [8, 8, 15, 15, 55, 88, 88, 94]);
       assert.ok(progressEvents.some((progress) => progress.indeterminate && /XeLaTeX/.test(progress.message)));
+
+      await fs.writeFile(path.join(root, "main.lof"), "被破坏的插图目录辅助文件\n");
+      const repaired = await new LatexCompiler().compile(project, 4, () => undefined);
+      assert.equal(repaired.passes, 2, "任一扩展辅助文件不稳定时必须继续，连续稳定后才能省略剩余遍次。");
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -140,6 +162,16 @@ describe("编译产物发布事务", () => {
           validateBeforeCommit: async () => {
             assert.equal(await fs.readFile(path.join(root, "main.pdf"), "utf8"), "new-pdf");
             assert.equal(await fs.readFile(path.join(root, "main.synctex.gz"), "utf8"), "new-sync");
+            const marker = JSON.parse(
+              await fs.readFile(path.join(root, ".circletex-build-transaction.json"), "utf8")
+            ) as { names: string[] };
+            assert.deepEqual(marker.names, ["main.pdf", "main.synctex.gz"]);
+            const entries = await fs.readdir(root);
+            assert.equal(
+              entries.some((name) => /^\.circletex-.*\.tmp$/u.test(name)),
+              false,
+              "事务标记与新产物都应通过 rename 提交，不应留下临时文件。"
+            );
             validatorObservedNewArtifacts = true;
             throw new Error("编辑器源码在提交前发生了变化。");
           }
@@ -185,6 +217,85 @@ describe("编译产物发布事务", () => {
     } finally {
       await fs.rm(root, { recursive: true, force: true });
       await fs.rm(build, { recursive: true, force: true });
+    }
+  });
+
+  it("发布并恢复扩展的文献、目录与索引辅助文件", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "circletex-publish-test-"));
+    const build = await fs.mkdtemp(path.join(os.tmpdir(), "circletex-build-test-"));
+    try {
+      const source = "unchanged-source";
+      const names = ["main.lof", "main.lot", "main.bbl", "main.bcf", "main.run.xml", "main.idx", "main.ind"];
+      await fs.writeFile(path.join(root, "main.tex"), source);
+      await fs.writeFile(path.join(root, "main.pdf"), "old-pdf");
+      await fs.writeFile(path.join(build, "main.pdf"), "new-pdf");
+      for (const name of names) {
+        await fs.writeFile(path.join(root, name), `old-${name}`);
+        await fs.writeFile(path.join(build, name), `new-${name}`);
+      }
+
+      await assert.rejects(
+        publishBuild(root, build, {
+          sourcePath: path.join(root, "main.tex"),
+          expectedSourceHash: createHash("sha256").update(source).digest("hex"),
+          validateBeforeCommit: () => {
+            throw new Error("模拟提交故障");
+          }
+        }),
+        /模拟提交故障/
+      );
+
+      assert.equal(await fs.readFile(path.join(root, "main.pdf"), "utf8"), "old-pdf");
+      for (const name of names) {
+        assert.equal(await fs.readFile(path.join(root, name), "utf8"), `old-${name}`);
+      }
+      await assert.rejects(fs.stat(path.join(root, ".circletex-build-transaction.json")));
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(build, { recursive: true, force: true });
+    }
+  });
+
+  it("恢复所需备份缺失时保留事务标记供人工处理", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "circletex-transaction-test-"));
+    try {
+      const backup = path.join(root, "backup", "circletex-build", "test");
+      await fs.mkdir(backup, { recursive: true });
+      await fs.writeFile(path.join(root, "main.pdf"), "partial-new-pdf");
+      const marker = path.join(root, ".circletex-build-transaction.json");
+      await fs.writeFile(marker, JSON.stringify({
+        id: "test",
+        backupDirectory: backup,
+        names: ["main.pdf"],
+        originallyExisting: ["main.pdf"]
+      }));
+
+      await assert.rejects(
+        new LatexCompiler().recoverInterruptedPublish(root),
+        /缺少备份/
+      );
+      assert.equal(await fs.readFile(path.join(root, "main.pdf"), "utf8"), "partial-new-pdf");
+      assert.equal((await fs.stat(marker)).isFile(), true);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("没有正式事务标记时清理中断留下的临时文件", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "circletex-transaction-test-"));
+    try {
+      const temporaryMarker = path.join(root, ".circletex-build-transaction-stale.tmp");
+      const temporaryArtifact = path.join(root, ".circletex-stale-main.pdf.tmp");
+      await fs.writeFile(temporaryMarker, "partial-marker");
+      await fs.writeFile(temporaryArtifact, "partial-pdf");
+      await fs.writeFile(path.join(root, "main.pdf"), "current-pdf");
+
+      await new LatexCompiler().recoverInterruptedPublish(root);
+      await assert.rejects(fs.stat(temporaryMarker));
+      await assert.rejects(fs.stat(temporaryArtifact));
+      assert.equal(await fs.readFile(path.join(root, "main.pdf"), "utf8"), "current-pdf");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 });

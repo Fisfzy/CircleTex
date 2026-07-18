@@ -51,6 +51,8 @@ export class LatexCompiler {
       const sourceHash = await hashFile(project.tex);
       const seedStartedAt = Date.now();
       const auxiliarySeed = await seedAuxiliaryFiles(project.root, buildDirectory);
+      let auxiliaryBaseline = auxiliarySeed.hashes;
+      let auxiliaryBaselineComplete = auxiliarySeed.complete;
       logDuration(onOutput, "辅助文件预热", seedStartedAt);
       const locateStartedAt = Date.now();
       const xelatex = await findExecutable("xelatex");
@@ -107,19 +109,26 @@ export class LatexCompiler {
         if ((await hashFile(project.tex)) !== sourceHash) {
           throw new Error("main.tex 在编译期间发生了变化，已取消发布本次 PDF。");
         }
-        if (
-          index === 1 &&
-          passes === 2 &&
-          auxiliarySeed.seededCount > 0 &&
-          await auxiliaryFilesStable(buildDirectory, auxiliarySeed.hashes) &&
-          !await logRequiresAnotherPass(buildDirectory)
-        ) {
-          onOutput("辅助文件稳定且日志未要求重跑，安全省略第 2 遍 XeLaTeX。\n");
-          reportCompileProgress(onProgress, 88, "辅助文件稳定，已省略第 2 遍 XeLaTeX");
-          break;
-        }
-        if (index === 1 && passes === 2) {
-          reportCompileProgress(onProgress, 60, "辅助文件仍需更新，将继续第 2 遍 XeLaTeX");
+        if (index < passes) {
+          const currentAuxiliaryHashes = await readAuxiliaryHashes(buildDirectory);
+          if (
+            auxiliaryBaselineComplete &&
+            auxiliaryFilesStable(currentAuxiliaryHashes, auxiliaryBaseline) &&
+            !await logRequiresAnotherPass(buildDirectory)
+          ) {
+            const remainingPasses = passes - index;
+            const omitted = remainingPasses === 1
+              ? `第 ${index + 1} 遍 XeLaTeX`
+              : `后续 ${remainingPasses} 遍 XeLaTeX`;
+            onOutput(`辅助文件稳定且日志未要求重跑，安全省略${omitted}。\n`);
+            reportCompileProgress(onProgress, 88, `辅助文件稳定，已省略${omitted}`);
+            break;
+          }
+          auxiliaryBaseline = currentAuxiliaryHashes;
+          auxiliaryBaselineComplete = currentAuxiliaryHashes.get("main.aux") !== undefined;
+          if (index === 1 && passes === 2) {
+            reportCompileProgress(onProgress, 60, "辅助文件仍需更新，将继续第 2 遍 XeLaTeX");
+          }
         }
       }
 
@@ -237,6 +246,7 @@ export async function publishBuild(
       const target = path.join(projectRoot, name);
       const next = path.join(projectRoot, `.circletex-${timestamp}-${name}.tmp`);
       await fs.copyFile(built, next);
+      await syncFile(next);
       staged.push({ next, target });
     }
     const transaction: PublishTransaction = {
@@ -245,9 +255,10 @@ export async function publishBuild(
       names,
       originallyExisting
     };
-    await fs.writeFile(transactionPath(projectRoot), JSON.stringify(transaction), "utf8");
+    await writeTransactionMarker(projectRoot, transaction);
     for (const item of staged) {
-      await fs.copyFile(item.next, item.target);
+      // 暂存文件与目标文件位于同一目录，rename 使单个产物不会暴露复制到一半的内容。
+      await fs.rename(item.next, item.target);
     }
     if ((await hashFile(options.sourcePath)) !== options.expectedSourceHash) {
       throw new Error("main.tex 在产物发布期间发生了变化，已拒绝提交本次编译产物。");
@@ -272,44 +283,75 @@ interface PublishTransaction {
   originallyExisting: string[];
 }
 
-const BUILD_ARTIFACTS = ["main.pdf", "main.synctex.gz", "main.aux", "main.log", "main.out", "main.toc"];
-const AUXILIARY_ARTIFACTS = ["main.aux", "main.out", "main.toc"];
+const AUXILIARY_ARTIFACTS = [
+  "main.aux",
+  "main.out",
+  "main.toc",
+  "main.lof",
+  "main.lot",
+  "main.bbl",
+  "main.bcf",
+  "main.blg",
+  "main.run.xml",
+  "main.idx",
+  "main.ind",
+  "main.ilg",
+  "main.glo",
+  "main.gls",
+  "main.glg",
+  "main.acn",
+  "main.acr",
+  "main.alg",
+  "main.nlo",
+  "main.nls",
+  "main.nlg",
+  "main.nav",
+  "main.snm",
+  "main.vrb"
+] as const;
+const BUILD_ARTIFACTS = ["main.pdf", "main.synctex.gz", "main.log", ...AUXILIARY_ARTIFACTS];
 const TRANSACTION_FILE = ".circletex-build-transaction.json";
 
 interface AuxiliarySeed {
   hashes: Map<string, string | undefined>;
-  seededCount: number;
+  complete: boolean;
 }
 
 async function seedAuxiliaryFiles(projectRoot: string, buildDirectory: string): Promise<AuxiliarySeed> {
   const hashes = new Map<string, string | undefined>();
-  let seededCount = 0;
   for (const name of AUXILIARY_ARTIFACTS) {
     const source = path.join(projectRoot, name);
     const destination = path.join(buildDirectory, name);
     if (await isFile(source)) {
       await fs.copyFile(source, destination);
       hashes.set(name, await hashBinaryFile(destination));
-      seededCount += 1;
     } else {
       hashes.set(name, undefined);
     }
   }
-  return { hashes, seededCount };
+  // main.aux 是跨遍收敛的最低完整基线；仅有 toc/out 等零散文件时必须继续编译。
+  return { hashes, complete: hashes.get("main.aux") !== undefined };
 }
 
-async function auxiliaryFilesStable(
-  buildDirectory: string,
+function auxiliaryFilesStable(
+  current: Map<string, string | undefined>,
   before: Map<string, string | undefined>
-): Promise<boolean> {
+): boolean {
   for (const name of AUXILIARY_ARTIFACTS) {
-    const filePath = path.join(buildDirectory, name);
-    const after = await isFile(filePath) ? await hashBinaryFile(filePath) : undefined;
-    if (after !== before.get(name)) {
+    if (current.get(name) !== before.get(name)) {
       return false;
     }
   }
   return true;
+}
+
+async function readAuxiliaryHashes(directory: string): Promise<Map<string, string | undefined>> {
+  const hashes = new Map<string, string | undefined>();
+  for (const name of AUXILIARY_ARTIFACTS) {
+    const filePath = path.join(directory, name);
+    hashes.set(name, await isFile(filePath) ? await hashBinaryFile(filePath) : undefined);
+  }
+  return hashes;
 }
 
 async function logRequiresAnotherPass(buildDirectory: string): Promise<boolean> {
@@ -323,11 +365,12 @@ async function logRequiresAnotherPass(buildDirectory: string): Promise<boolean> 
 }
 
 export function latexLogRequiresAnotherPass(log: string): boolean {
-  return /(?:Rerun to get|Please (?:re)?run|run (?:LaTeX|Biber) again|Label\(s\) may have changed|There were undefined references|(?:Citation|Reference) [`'].+?[`'].*undefined|Package rerunfilecheck Warning)/i.test(log);
+  return /(?:Rerun (?:to get|LaTeX|XeLaTeX|Biber)|Please (?:\(re\)|re)?run|run (?:LaTeX|XeLaTeX|Biber) again|Label\(s\) may have changed|There were undefined references|(?:Citation|Reference) [`'].+?[`'].*undefined|Package rerunfilecheck Warning)/i.test(log);
 }
 
 async function hashBinaryFile(filePath: string): Promise<string> {
-  return createHash("sha256").update(await fs.readFile(filePath, "utf8")).digest("hex");
+  const bytes = Uint8Array.from(await fs.readFile(filePath));
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 function logDuration(onOutput: (text: string) => void, label: string, startedAt: number): void {
@@ -378,17 +421,26 @@ async function recoverPublishTransaction(
     throw new Error(`构建事务标记损坏，请人工检查：${marker}`);
   }
   validateTransaction(projectRoot, transaction);
-  for (const name of transaction.names) {
-    const target = path.join(projectRoot, name);
-    const backup = path.join(transaction.backupDirectory, name);
-    if (transaction.originallyExisting.includes(name)) {
-      if (!(await isFile(backup))) {
-        throw new Error(`无法恢复上一版编译产物，缺少备份：${backup}`);
+  const restorationStages: string[] = [];
+  try {
+    for (const name of transaction.names) {
+      const target = path.join(projectRoot, name);
+      const backup = path.join(transaction.backupDirectory, name);
+      if (transaction.originallyExisting.includes(name)) {
+        if (!(await isFile(backup))) {
+          throw new Error(`无法恢复上一版编译产物，缺少备份：${backup}`);
+        }
+        const next = path.join(projectRoot, `.circletex-recover-${transaction.id}-${name}.tmp`);
+        await fs.copyFile(backup, next);
+        await syncFile(next);
+        restorationStages.push(next);
+        await fs.rename(next, target);
+      } else {
+        await fs.rm(target, { force: true });
       }
-      await fs.copyFile(backup, target);
-    } else {
-      await fs.rm(target, { force: true });
     }
+  } finally {
+    await Promise.allSettled(restorationStages.map((stage) => fs.rm(stage, { force: true })));
   }
   await fs.rm(marker, { force: true });
   await removeOrphanedStages(projectRoot);
@@ -400,8 +452,11 @@ function validateTransaction(projectRoot: string, transaction: PublishTransactio
     !transaction ||
     typeof transaction.id !== "string" ||
     typeof transaction.backupDirectory !== "string" ||
+    !/^[A-Za-z0-9._-]+$/.test(transaction.id) ||
     !Array.isArray(transaction.names) ||
     !Array.isArray(transaction.originallyExisting) ||
+    new Set(transaction.names).size !== transaction.names.length ||
+    new Set(transaction.originallyExisting).size !== transaction.originallyExisting.length ||
     transaction.names.some((name) => !BUILD_ARTIFACTS.includes(name)) ||
     transaction.originallyExisting.some((name) => !transaction.names.includes(name))
   ) {
@@ -424,6 +479,36 @@ async function removeOrphanedStages(projectRoot: string): Promise<void> {
 
 function transactionPath(projectRoot: string): string {
   return path.join(projectRoot, TRANSACTION_FILE);
+}
+
+async function writeTransactionMarker(projectRoot: string, transaction: PublishTransaction): Promise<void> {
+  const marker = transactionPath(projectRoot);
+  if (await isFile(marker)) {
+    throw new Error(`已有未完成的构建事务，请先恢复：${marker}`);
+  }
+  const temporary = path.join(projectRoot, `.circletex-build-transaction-${transaction.id}.tmp`);
+  try {
+    const handle = await fs.open(temporary, "wx");
+    try {
+      await handle.writeFile(JSON.stringify(transaction), "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await fs.rename(temporary, marker);
+  } finally {
+    await fs.rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+async function syncFile(filePath: string): Promise<void> {
+  // Windows 需要可写句柄才能执行 FlushFileBuffers（Node 的 fsync）。
+  const handle = await fs.open(filePath, "r+");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
 }
 
 async function readLatexWarnings(root: string): Promise<string[]> {

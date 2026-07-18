@@ -1026,6 +1026,58 @@ pre {
   font-size: 12px;
 }
 .skill-artifact-row span { min-width: 0; overflow-wrap: anywhere; }
+.terminology-panel {
+  display: grid;
+  gap: 8px;
+  margin: 0 12px 8px;
+  padding: 9px;
+  border: 1px solid var(--vscode-panel-border, transparent);
+  background: var(--vscode-editorWidget-background);
+  font-size: 12px;
+}
+.terminology-header { display: flex; align-items: center; gap: 8px; }
+.terminology-header span { color: var(--vscode-descriptionForeground); }
+.terminology-header button { margin-left: auto; }
+.terminology-proposal { display: grid; gap: 5px; padding-top: 7px; border-top: 1px solid var(--vscode-panel-border, transparent); }
+.terminology-proposal ul { margin: 0; padding-left: 18px; }
+.terminology-proposal-actions { display: flex; align-items: center; gap: 6px; }
+.terminology-findings { display: grid; gap: 4px; color: var(--vscode-descriptionForeground); overflow-wrap: anywhere; }
+.terminology-finding-list { display: flex; flex-wrap: wrap; gap: 4px 10px; margin: 0; padding-left: 18px; }
+.terminology-finding-link {
+  appearance: none;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  color: var(--vscode-textLink-foreground);
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.terminology-finding-link:hover { color: var(--vscode-textLink-activeForeground); text-decoration: underline; }
+.terminology-undo { display: flex; align-items: center; gap: 8px; color: var(--vscode-descriptionForeground); }
+.terminology-gate-list { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.terminology-gate-list li { display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--vscode-panel-border, transparent); padding-top: 4px; }
+.terminology-gate-body { min-width: 0; flex: 1; display: grid; gap: 2px; }
+.terminology-gate-body span { min-width: 0; overflow-wrap: anywhere; }
+.terminology-gate-body small { color: var(--vscode-descriptionForeground); overflow-wrap: anywhere; }
+.terminology-gate-list .icon-button { flex: none; width: 24px; height: 24px; }
+#terminology-gates { position: relative; }
+.terminology-badge {
+  position: absolute;
+  top: -4px;
+  right: -5px;
+  min-width: 14px;
+  height: 14px;
+  box-sizing: border-box;
+  padding: 0 3px;
+  border-radius: 7px;
+  color: var(--vscode-badge-foreground);
+  background: var(--vscode-badge-background);
+  font-size: 9px;
+  line-height: 14px;
+  font-variant-numeric: tabular-nums;
+}
 .compile-progress {
   display: grid;
   gap: 5px;

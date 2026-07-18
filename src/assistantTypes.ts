@@ -17,6 +17,11 @@ export interface RevisionAdapter {
     instruction: string,
     onOutput?: (text: string) => void
   ): Promise<CodexResult>;
+  generateTerminologyProposal?(
+    projectRoot: string,
+    instruction: string,
+    onOutput?: (text: string) => void
+  ): Promise<unknown>;
 }
 
 export class AssistantUnavailableError extends Error {

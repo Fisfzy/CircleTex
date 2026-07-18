@@ -2,7 +2,7 @@
   "name": "circletex",
   "displayName": "CircleTeX",
   "description": "在 PDF 审阅界面中直接修改 LaTeX 正文与图片尺寸，并从 main.tex 导出保留论文版式、公式全部可编辑的 MathType Word。",
-  "version": "0.11.6",
+  "version": "0.13.0",
   "publisher": "local",
   "license": "SEE LICENSE IN LICENSE.txt",
   "engines": {
@@ -256,14 +256,16 @@
     "compile": "npm run copy:assets && tsc -p ./",
     "watch": "tsc -watch -p ./",
     "check:webview": "node --check media/viewer.js",
-    "test:unit": "node --test out/test/applyRange.test.js out/test/assistantTypes.test.js out/test/codex.test.js out/test/compilerTransaction.test.js out/test/imageBoundary.test.js out/test/imageEditResolver.test.js out/test/latexProjection.test.js out/test/manualEdits.test.js out/test/processRunner.test.js out/test/regionEditResolver.test.js out/test/selectionPayload.test.js out/test/skillManifest.test.js out/test/skillPackage.test.js out/test/skillRegistry.test.js out/test/skillTask.test.js out/test/snow.test.js out/test/synctex.test.js out/test/synctexParser.test.js",
+    "test:unit": "node --test out/test/applyRange.test.js out/test/assistantTypes.test.js out/test/codex.test.js out/test/compilerTransaction.test.js out/test/imageBoundary.test.js out/test/imageEditResolver.test.js out/test/latexProjection.test.js out/test/manualEdits.test.js out/test/processRunner.test.js out/test/regionEditResolver.test.js out/test/selectionPayload.test.js out/test/skillManifest.test.js out/test/skillPackage.test.js out/test/skillRegistry.test.js out/test/skillTask.test.js out/test/snow.test.js out/test/synctex.test.js out/test/synctexParser.test.js out/test/terminologyGates.test.js",
     "test:word-layout": "pwsh -NoProfile -STA -File scripts/smoke-word-layout.ps1",
     "test:word": "pwsh -NoProfile -STA -File scripts/smoke-mathtype-word.ps1",
     "test:manual-tex": "node scripts/smoke-manual-tex.mjs",
     "test:viewer": "node scripts/smoke-viewer.mjs",
-    "test": "npm run compile && npm run check:webview && npm run test:unit && npm run test:manual-tex && npm run test:viewer && npm run test:word-layout && npm run test:word",
+    "test:fast": "npm run compile && npm run check:webview && npm run test:unit",
+    "test:full": "npm run test:fast && npm run test:manual-tex && npm run test:viewer && npm run test:word-layout && npm run test:word",
+    "test": "npm run test:fast",
     "package": "vsce package --no-dependencies --allow-missing-repository",
-    "vscode:prepublish": "npm test"
+    "vscode:prepublish": "npm run test:fast"
   },
   "devDependencies": {
     "@types/node": "20.16.1",

@@ -156,6 +156,34 @@ showManualEditsDiffButton.disabled = true;
 elements.manualClear.after(showManualEditsDiffButton);
 elements.showManualEditsDiff = showManualEditsDiffButton;
 
+const terminologyButton = document.createElement("button");
+terminologyButton.id = "terminology-gates";
+terminologyButton.className = "icon-button";
+terminologyButton.type = "button";
+terminologyButton.innerHTML = '<span aria-hidden="true">术</span><span id="terminology-badge" class="terminology-badge" hidden></span>';
+terminologyButton.title = "术语门禁";
+terminologyButton.setAttribute("aria-label", "打开术语门禁");
+terminologyButton.setAttribute("aria-controls", "terminology-panel");
+terminologyButton.setAttribute("aria-expanded", "false");
+const terminologyPanel = document.createElement("section");
+terminologyPanel.id = "terminology-panel";
+terminologyPanel.className = "terminology-panel";
+terminologyPanel.hidden = true;
+terminologyPanel.setAttribute("aria-labelledby", "terminology-heading");
+terminologyPanel.innerHTML = '<div class="terminology-header"><strong id="terminology-heading">术语门禁</strong><span id="terminology-count"></span><button id="terminology-scan" class="secondary-button" type="button">扫描适用范围</button></div><div id="terminology-proposal" class="terminology-proposal" hidden></div><div id="terminology-findings" class="terminology-findings"></div><div id="terminology-projected-findings" class="terminology-findings" hidden></div><div id="terminology-undo" class="terminology-undo" hidden></div><ol id="terminology-gate-list" class="terminology-gate-list"></ol>';
+elements.compile.before(terminologyButton);
+elements.promptBar.before(terminologyPanel);
+elements.terminologyButton = terminologyButton;
+elements.terminologyPanel = terminologyPanel;
+elements.terminologyBadge = terminologyButton.querySelector("#terminology-badge");
+elements.terminologyCount = terminologyPanel.querySelector("#terminology-count");
+elements.terminologyScan = terminologyPanel.querySelector("#terminology-scan");
+elements.terminologyProposal = terminologyPanel.querySelector("#terminology-proposal");
+elements.terminologyFindings = terminologyPanel.querySelector("#terminology-findings");
+elements.terminologyProjectedFindings = terminologyPanel.querySelector("#terminology-projected-findings");
+elements.terminologyUndo = terminologyPanel.querySelector("#terminology-undo");
+elements.terminologyGateList = terminologyPanel.querySelector("#terminology-gate-list");
+
 for (const [button, hint, shortcut] of [
   [elements.regionSelect, "区域框选：选择连续正文或图片", ""],
   [elements.directEdit, "文字或光标选择：建立直接编辑草稿", ""],
@@ -224,6 +252,17 @@ const state = {
   assistantName: "AI 助手",
   skills: [],
   selectedTask: "revision",
+  terminologyGates: [],
+  terminologyFindings: [],
+  terminologyProjectedFindings: [],
+  terminologyProposal: undefined,
+  terminologyRevision: 0,
+  terminologyStateSequence: 0,
+  terminologySourceHash: undefined,
+  terminologyBusy: undefined,
+  terminologyProposalRequestId: undefined,
+  terminologyScanRequestId: undefined,
+  terminologyLastRemoved: undefined,
   skillTaskRunning: false,
   skillProgressPercent: 0,
   skillProgressStartedAt: undefined,
@@ -243,6 +282,8 @@ const state = {
   pendingWheelAnchor: undefined,
   pageInputFocused: false,
   pdfRefreshInProgress: false,
+  pdfFetchController: undefined,
+  pdfLoadingTask: undefined,
   compileProgressActive: false,
   compileProgressPercent: 0,
   compileProgressHideTimer: undefined,
@@ -281,6 +322,11 @@ function applyDockCollapsed(value) {
     elements.dockToggle.title = `${label}${state.dockCollapsed ? "，恢复编辑与确认模块" : "，扩大 PDF 阅读视窗"}`;
     elements.dockToggle.setAttribute("aria-label", label);
     elements.dockToggle.setAttribute("aria-expanded", String(!state.dockCollapsed));
+  }
+  if (elements.terminologyButton) {
+    const terminologyExpanded = !state.dockCollapsed && !elements.terminologyPanel.hidden;
+    elements.terminologyButton.setAttribute("aria-expanded", String(terminologyExpanded));
+    elements.terminologyButton.setAttribute("aria-label", terminologyExpanded ? "关闭术语门禁" : "打开术语门禁");
   }
   updateCollapsedDockProgress();
 }
@@ -341,20 +387,34 @@ function showImmediateStartupPreview() {
 
 async function loadPdf({ preservePosition = true } = {}) {
   const requestId = ++state.pdfLoadSequence;
+  state.pdfFetchController?.abort();
+  if (state.pdfLoadingTask) {
+    void state.pdfLoadingTask.destroy().catch(() => undefined);
+    state.pdfLoadingTask = undefined;
+  }
+  const fetchController = new AbortController();
+  state.pdfFetchController = fetchController;
   if (!state.compileProgressActive) {
     state.preserveCompileStatus = false;
   }
   state.pdfRefreshInProgress = true;
   try {
-    await loadPdfCore({ preservePosition, requestId });
+    await loadPdfCore({ preservePosition, requestId, signal: fetchController.signal });
+  } catch (error) {
+    if (requestId === state.pdfLoadSequence && !fetchController.signal.aborted) {
+      throw error;
+    }
   } finally {
+    if (state.pdfFetchController === fetchController) {
+      state.pdfFetchController = undefined;
+    }
     if (requestId === state.pdfLoadSequence) {
       state.pdfRefreshInProgress = false;
     }
   }
 }
 
-async function loadPdfCore({ preservePosition = true, requestId }) {
+async function loadPdfCore({ preservePosition = true, requestId, signal }) {
   const loadStartedAt = performance.now();
   const restore = preservePosition && state.document ? captureViewState() : {
     pageNumber: positivePage(persisted.pageNumber) || state.currentPage,
@@ -371,7 +431,7 @@ async function loadPdfCore({ preservePosition = true, requestId }) {
   if (state.compileProgressActive) {
     updateCompileProgress({ percent: 94, message: "正在读取新 PDF", indeterminate: true });
   }
-  const response = await fetch(config.pdfUri, { cache: "no-store" });
+  const response = await fetch(config.pdfUri, { cache: "no-store", signal });
   if (!response.ok) {
     throw new Error(`无法读取 main.pdf：${response.status}`);
   }
@@ -390,111 +450,127 @@ async function loadPdfCore({ preservePosition = true, requestId }) {
     cMapPacked: true,
     standardFontDataUrl: config.standardFontsUri
   });
-  const nextDocument = await loadingTask.promise;
-  ensureCurrentPdfLoad(requestId);
-  reportPerformance("PDF Worker 解析", workerStartedAt);
-  setLoading("正在读取当前页面信息……", 68);
-  const restorePageNumber = clamp(restore.pageNumber, 1, nextDocument.numPages);
-  let preferredMetadata;
+  state.pdfLoadingTask = loadingTask;
+  let nextDocument;
+  let documentAdopted = false;
   try {
+    nextDocument = await loadingTask.promise;
+    ensureCurrentPdfLoad(requestId);
+    reportPerformance("PDF Worker 解析", workerStartedAt);
+    setLoading("正在读取当前页面信息……", 68);
+    const restorePageNumber = clamp(restore.pageNumber, 1, nextDocument.numPages);
+    let preferredMetadata;
     preferredMetadata = await readSinglePageMetadata(nextDocument, restorePageNumber);
-  } catch (error) {
-    await nextDocument.destroy();
-    throw error;
-  }
-  ensureCurrentPdfLoad(requestId);
+    ensureCurrentPdfLoad(requestId);
 
-  const oldDocument = state.document;
-  const refreshSnapshot = capturePageSnapshot(restore.pageNumber);
-  state.loadGeneration += 1;
-  if (state.scrollFrame) {
-    cancelAnimationFrame(state.scrollFrame);
-    state.scrollFrame = 0;
-  }
-  state.observer?.disconnect();
-  disposeAllPages();
-  state.document = nextDocument;
-  state.pageStates = [];
-  state.renderQueue = [];
-  state.queuedPages.clear();
-  elements.pages.replaceChildren();
-  if (oldDocument) {
-    void oldDocument.destroy().catch((error) => console.error(error));
-  }
+    const oldDocument = state.document;
+    const refreshSnapshot = capturePageSnapshot(restore.pageNumber);
+    state.loadGeneration += 1;
+    if (state.scrollFrame) {
+      cancelAnimationFrame(state.scrollFrame);
+      state.scrollFrame = 0;
+    }
+    state.observer?.disconnect();
+    disposeAllPages();
+    state.document = nextDocument;
+    documentAdopted = true;
+    if (state.pdfLoadingTask === loadingTask) {
+      state.pdfLoadingTask = undefined;
+    }
+    state.pageStates = [];
+    state.renderQueue = [];
+    state.queuedPages.clear();
+    elements.pages.replaceChildren();
+    if (oldDocument) {
+      void oldDocument.destroy().catch((error) => console.error(error));
+    }
 
-  state.fitMode = restore.fitMode !== false;
-  state.scale = state.fitMode ? computeFitScale([preferredMetadata]) : clamp(restore.scale, 0.45, 3);
-  const initialMetadata = Array.from({ length: nextDocument.numPages }, (_, index) => ({
-    ...preferredMetadata,
-    number: index + 1
-  }));
-  const shellsStartedAt = performance.now();
-  setLoading("正在建立连续页面……", 76);
-  buildPageShells(initialMetadata, false);
-  elements.pageCount.textContent = `/ ${nextDocument.numPages}`;
-  elements.pageNumber.max = String(nextDocument.numPages);
-  elements.zoomValue.textContent = `${Math.round(state.scale * 100)}%`;
-  state.currentPage = restorePageNumber;
-  attachPageSnapshot(refreshSnapshot, state.pageStates[restorePageNumber - 1]);
-  attachStartupPreview(state.pageStates[restorePageNumber - 1]);
-  await nextFrame();
-  await nextFrame();
-  ensureCurrentPdfLoad(requestId);
-  restoreViewState({ ...restore, pageNumber: restorePageNumber });
-  fadeOutAndRemove(immediateStartupPreview);
-  reportPerformance("PDF 首屏页面壳体", shellsStartedAt);
-  state.desiredPages = new Set([restorePageNumber]);
-  const generation = state.loadGeneration;
-  const primaryRecord = state.pageStates[restorePageNumber - 1];
-  primaryRecord.status = "previewing";
-  let previewPromise = Promise.resolve();
-  if (!refreshSnapshot && !state.startupPreview) {
-    const previewStartedAt = performance.now();
-    previewPromise = renderLowResolutionPreview(primaryRecord).then(() => {
-      if (state.loadGeneration === generation) reportPerformance("PDF 首屏低清预览", previewStartedAt);
-    });
-  }
-  setLoading("正在渲染当前页并准备文字选择……", 90, true);
-  setStatus("PDF 页面已显示，正在准备清晰页面与文字选择……", "busy");
-  state.pdfRefreshInProgress = false;
-  if (state.compileProgressActive) {
-    updateCompileProgress({ percent: 98, message: "正在后台补齐清晰页面与文字选择", indeterminate: true });
-  }
-  for (const record of state.pageStates) {
-    state.observer.observe(record.shell);
-  }
-  state.primaryRenderPending = true;
-  void (async () => {
-    try {
-      await previewPromise.catch((error) => console.error(error));
-      if (state.loadGeneration !== generation) return;
-      if (requestId !== state.pdfLoadSequence) return;
-      setLoading("PDF 页面已显示，正在后台准备清晰文字层", 100);
-      hideLoading();
-      if (state.currentPage !== restorePageNumber) {
-        primaryRecord.status = "idle";
-        return;
+    state.fitMode = restore.fitMode !== false;
+    state.scale = state.fitMode ? computeFitScale([preferredMetadata]) : clamp(restore.scale, 0.45, 3);
+    const initialMetadata = Array.from({ length: nextDocument.numPages }, (_, index) => ({
+      ...preferredMetadata,
+      number: index + 1
+    }));
+    const shellsStartedAt = performance.now();
+    setLoading("正在建立连续页面……", 76);
+    buildPageShells(initialMetadata, false);
+    elements.pageCount.textContent = `/ ${nextDocument.numPages}`;
+    elements.pageNumber.max = String(nextDocument.numPages);
+    elements.zoomValue.textContent = `${Math.round(state.scale * 100)}%`;
+    state.currentPage = restorePageNumber;
+    attachPageSnapshot(refreshSnapshot, state.pageStates[restorePageNumber - 1]);
+    attachStartupPreview(state.pageStates[restorePageNumber - 1]);
+    await nextFrame();
+    await nextFrame();
+    ensureCurrentPdfLoad(requestId);
+    restoreViewState({ ...restore, pageNumber: restorePageNumber });
+    fadeOutAndRemove(immediateStartupPreview);
+    reportPerformance("PDF 首屏页面壳体", shellsStartedAt);
+    state.desiredPages = new Set([restorePageNumber]);
+    const generation = state.loadGeneration;
+    const primaryRecord = state.pageStates[restorePageNumber - 1];
+    primaryRecord.status = "previewing";
+    let previewPromise = Promise.resolve();
+    if (!refreshSnapshot && !state.startupPreview) {
+      const previewStartedAt = performance.now();
+      previewPromise = renderLowResolutionPreview(primaryRecord).then(() => {
+        if (state.loadGeneration === generation) reportPerformance("PDF 首屏低清预览", previewStartedAt);
+      });
+    }
+    setLoading("正在渲染当前页并准备文字选择……", 90, true);
+    setStatus("PDF 页面已显示，正在准备清晰页面与文字选择……", "busy");
+    state.pdfRefreshInProgress = false;
+    if (state.compileProgressActive) {
+      updateCompileProgress({ percent: 98, message: "正在后台补齐清晰页面与文字选择", indeterminate: true });
+    }
+    for (const record of state.pageStates) {
+      state.observer.observe(record.shell);
+    }
+    state.primaryRenderPending = true;
+    void (async () => {
+      try {
+        await previewPromise.catch((error) => console.error(error));
+        if (state.loadGeneration !== generation) return;
+        if (requestId !== state.pdfLoadSequence) return;
+        setLoading("PDF 页面已显示，正在后台准备清晰文字层", 100);
+        hideLoading();
+        if (state.currentPage !== restorePageNumber) {
+          primaryRecord.status = "idle";
+          return;
+        }
+        const primaryRenderStartedAt = performance.now();
+        await renderPageRecord(primaryRecord, { primary: true });
+        if (state.loadGeneration !== generation) return;
+        if (requestId !== state.pdfLoadSequence) return;
+        reportPerformance("PDF 当前页渲染", primaryRenderStartedAt);
+        reportPerformance("PDF 刷新总计", loadStartedAt);
+      } finally {
+        if (state.loadGeneration === generation) {
+          state.primaryRenderPending = false;
+          updateVisiblePages();
+        }
       }
-      const primaryRenderStartedAt = performance.now();
-      await renderPageRecord(primaryRecord, { primary: true });
+    })();
+    const metadataStartedAt = performance.now();
+    void readPageMetadata(nextDocument, restorePageNumber).then((metadata) => {
       if (state.loadGeneration !== generation) return;
-      if (requestId !== state.pdfLoadSequence) return;
-      reportPerformance("PDF 当前页渲染", primaryRenderStartedAt);
-      reportPerformance("PDF 刷新总计", loadStartedAt);
-    } finally {
-      if (state.loadGeneration === generation) {
-        state.primaryRenderPending = false;
-        updateVisiblePages();
+      applyPageMetadata(metadata);
+      reportPerformance("PDF 页面元数据扫描", metadataStartedAt);
+    }, (error) => console.error(error));
+    updateVisiblePages();
+  } catch (error) {
+    if (nextDocument && !documentAdopted) {
+      await nextDocument.destroy().catch(() => undefined);
+    }
+    throw error;
+  } finally {
+    if (state.pdfLoadingTask === loadingTask) {
+      state.pdfLoadingTask = undefined;
+      if (!documentAdopted) {
+        await loadingTask.destroy().catch(() => undefined);
       }
     }
-  })();
-  const metadataStartedAt = performance.now();
-  void readPageMetadata(nextDocument, restorePageNumber).then((metadata) => {
-    if (state.loadGeneration !== generation) return;
-    applyPageMetadata(metadata);
-    reportPerformance("PDF 页面元数据扫描", metadataStartedAt);
-  }, (error) => console.error(error));
-  updateVisiblePages();
+  }
 }
 
 async function readPdfResponse(response, onProgress) {
@@ -2955,13 +3031,14 @@ function updateAnalyzeAvailability() {
   const hasInstruction = elements.instruction.value.trim().length > 0;
   const confirmed = !state.requiresConfirmation || state.rangeConfirmed;
   const skill = selectedSkill();
+  const globalRules = state.selectedTask === "terminology";
   const requiresSelection = state.selectedTask === "revision" || skill?.scope === "selection";
   const usesSelection = requiresSelection || Boolean(skill && skill.scope === "either" && state.mappingId);
   const readyForScope = !usesSelection || Boolean(state.mappingId && confirmed);
-  elements.instruction.disabled = state.selectedTask === "revision" ? !state.mappingId : !skill;
+  elements.instruction.disabled = globalRules ? false : state.selectedTask === "revision" ? !state.mappingId : !skill;
   elements.analyze.disabled = state.skillTaskRunning ? false : !hasInstruction || !readyForScope ||
-    (state.selectedTask !== "revision" && !skill) || state.analyzing || state.pendingManualEditCount > 0 ||
-    Boolean(state.directDraft) || Boolean(state.candidateId) || isWriteInteractionBusy();
+    (state.selectedTask !== "revision" && !globalRules && !skill) || state.analyzing || state.pendingManualEditCount > 0 ||
+    Boolean(state.directDraft) || Boolean(state.candidateId) || Boolean(state.terminologyBusy) || isWriteInteractionBusy();
   updateTaskUi();
 }
 
@@ -3102,7 +3179,8 @@ function applyPageMetadata(metadata) {
 }
 
 function isWriteInteractionBusy() {
-  return Boolean(state.manualEditRequestId) || Boolean(state.imageQueueRequestId) || Boolean(state.rangeRequestId) || [
+  return Boolean(state.manualEditRequestId) || Boolean(state.imageQueueRequestId) || Boolean(state.rangeRequestId) ||
+    Boolean(state.terminologyBusy) || [
     "analyze",
     "skillTask",
     "apply",
@@ -3244,6 +3322,7 @@ function normalizePendingEdit(raw) {
     rects,
     insertedText: typeof raw.insertedText === "string" ? raw.insertedText : "",
     structuralFormula: raw.structuralFormula === true,
+    structuredNumeric: raw.structuredNumeric === true,
     ...(imageEdit ? {
       imagePath: typeof raw.imagePath === "string" ? raw.imagePath : "",
       originalValue: typeof raw.originalValue === "string" ? raw.originalValue : "原尺寸",
@@ -3318,6 +3397,7 @@ function pendingEditLabel(edit) {
     return `${page} 图片${delta >= 0 ? "放大" : "缩小"} ${Math.abs(delta)}%`;
   }
   if (edit.structuralFormula) return `${page} 删除完整公式结构`;
+  if (edit.structuredNumeric) return `${page} ${edit.kind === "replace" ? "替换" : "删除"}公式或表格数值`;
   const labels = { insertBefore: "前插", insertAfter: "后插", replace: "替换", delete: "删除" };
   const text = typeof edit.insertedText === "string" ? edit.insertedText.replace(/\s+/gu, " ").trim() : "";
   return text ? `${page} ${labels[edit.kind] ?? "编辑"}：${text.slice(0, 48)}` : `${page} ${labels[edit.kind] ?? "编辑"}`;
@@ -3469,6 +3549,222 @@ function updateAssistantName(value) {
   elements.manualHandoff.textContent = `复制任务并打开 ${name}`;
 }
 
+const terminologyKindLabels = {
+  preferredTerm: "优选术语",
+  abbreviation: "缩写首次释义",
+  symbolUnit: "符号与单位",
+  phraseRule: "措辞规则"
+};
+
+const terminologyScopeLabels = {
+  selection: "当前选区",
+  chapter: "当前章节",
+  document: "全文"
+};
+
+function setTerminologyBusy(action) {
+  state.terminologyBusy = action;
+  renderTerminology();
+  updateAnalyzeAvailability();
+  updateManualEditAvailability();
+}
+
+function renderTerminologyFindings(container, titleText, findings, emptyText, identity) {
+  const title = document.createElement("strong");
+  title.textContent = titleText;
+  if (!findings.length) {
+    const empty = document.createElement("span");
+    empty.textContent = emptyText;
+    container.replaceChildren(title, empty);
+    return;
+  }
+  const list = document.createElement("ol");
+  list.className = "terminology-finding-list";
+  for (const finding of findings.slice(0, 20)) {
+    const row = document.createElement("li");
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "terminology-finding-link";
+    open.textContent = `第 ${finding.line} 行“${finding.term}”${finding.severity === "warning" ? "（提醒）" : ""}`;
+    open.title = `在 main.tex 中打开第 ${finding.line} 行`;
+    open.setAttribute("aria-label", `打开 main.tex 第 ${finding.line} 行，命中 ${finding.term}`);
+    open.addEventListener("click", () => post("openTerminologyFinding", {
+      line: finding.line,
+      gateId: finding.gateId,
+      proposalId: identity?.proposalId,
+      gateRevision: identity?.gateRevision,
+      sourceHash: identity?.sourceHash
+    }));
+    row.append(open);
+    list.append(row);
+  }
+  const children = [title, list];
+  if (findings.length > 20) {
+    const more = document.createElement("span");
+    more.textContent = `另有 ${findings.length - 20} 项，请按规则筛查源码。`;
+    children.push(more);
+  }
+  container.replaceChildren(...children);
+}
+
+function renderTerminology() {
+  const gates = state.terminologyGates;
+  const findings = state.terminologyFindings;
+  const enabledCount = gates.filter((gate) => gate.enabled).length;
+  const busy = Boolean(state.terminologyBusy);
+  elements.terminologyCount.textContent = `${enabledCount} 条启用 · ${findings.length} 项命中`;
+  elements.terminologyBadge.hidden = enabledCount === 0;
+  elements.terminologyBadge.textContent = enabledCount > 99 ? "99+" : String(enabledCount);
+  elements.terminologyButton.title = enabledCount > 0 ? `术语门禁：${enabledCount} 条启用` : "术语门禁";
+  elements.terminologyScan.disabled = busy;
+  elements.terminologyScan.textContent = state.terminologyBusy === "scan" ? "扫描中…" : "扫描适用范围";
+  renderTerminologyFindings(
+    elements.terminologyFindings,
+    "当前适用范围命中",
+    findings,
+    "未发现已启用规则的违规项。",
+    {
+      gateRevision: state.terminologyRevision,
+      sourceHash: state.terminologySourceHash
+    }
+  );
+  elements.terminologyGateList.replaceChildren(...gates.map((gate) => {
+    const item = document.createElement("li");
+    const body = document.createElement("div");
+    body.className = "terminology-gate-body";
+    const text = document.createElement("span");
+    text.textContent = `${gate.preferred}${gate.forbidden.length ? ` · 禁用：${gate.forbidden.join("、")}` : ""}`;
+    const meta = document.createElement("small");
+    meta.textContent = `${terminologyKindLabels[gate.kind] || gate.kind} · ${terminologyScopeLabels[gate.scope] || gate.scope} · ${gate.severity === "block" ? "硬性门禁" : "提醒"} · ${gate.source || "来源未记录"}`;
+    body.append(text, meta);
+    const remove = document.createElement("button");
+    remove.className = "icon-button";
+    remove.textContent = "×";
+    remove.disabled = busy;
+    remove.title = `移除术语门禁“${gate.preferred}”`;
+    remove.setAttribute("aria-label", `移除术语门禁“${gate.preferred}”`);
+    remove.addEventListener("click", () => {
+      if (!window.confirm(`确定移除术语门禁“${gate.preferred}”吗？`)) return;
+      setTerminologyBusy("remove");
+      post("removeTerminologyGate", {
+        id: gate.id,
+        gateRevision: state.terminologyRevision
+      });
+    });
+    item.append(body, remove);
+    return item;
+  }));
+
+  const removed = state.terminologyLastRemoved;
+  if (removed) {
+    const text = document.createElement("span");
+    text.textContent = `已移除“${removed.preferred}”。`;
+    const undo = document.createElement("button");
+    undo.type = "button";
+    undo.className = "secondary-button";
+    undo.textContent = "撤销";
+    undo.disabled = busy || removed.removedRevision !== state.terminologyRevision;
+    undo.addEventListener("click", () => {
+      setTerminologyBusy("undoRemove");
+      post("undoRemoveTerminologyGate", {
+        id: removed.id,
+        gateRevision: state.terminologyRevision
+      });
+    });
+    elements.terminologyUndo.hidden = false;
+    elements.terminologyUndo.replaceChildren(text, undo);
+  } else {
+    elements.terminologyUndo.hidden = true;
+    elements.terminologyUndo.replaceChildren();
+  }
+
+  const proposal = state.terminologyProposal;
+  if (!proposal) {
+    elements.terminologyProposal.hidden = true;
+    elements.terminologyProposal.replaceChildren();
+    elements.terminologyProjectedFindings.hidden = true;
+    elements.terminologyProjectedFindings.replaceChildren();
+    return;
+  }
+  elements.terminologyProposal.hidden = false;
+  elements.terminologyProjectedFindings.hidden = false;
+  const title = document.createElement("strong");
+  title.textContent = `待确认：${proposal.intent}`;
+  const note = document.createElement("div");
+  const stale = proposal.baseGateRevision !== state.terminologyRevision;
+  note.textContent = stale ? "规则库已在草案生成后变化，请放弃并重新生成草案。" : proposal.note;
+  const list = document.createElement("ul");
+  for (const gate of proposal.operations) {
+    const row = document.createElement("li");
+    row.textContent = `${gate.preferred}${gate.forbidden.length ? `；禁用 ${gate.forbidden.join("、")}` : ""}；${terminologyKindLabels[gate.kind] || gate.kind}；${terminologyScopeLabels[gate.scope] || gate.scope}；${gate.severity === "block" ? "硬性门禁" : "提醒"}`;
+    list.append(row);
+  }
+  const actions = document.createElement("div");
+  actions.className = "terminology-proposal-actions";
+  const apply = document.createElement("button");
+  apply.className = "primary-button";
+  apply.textContent = state.terminologyBusy === "apply" ? "正在启用…" : "确认并启用";
+  apply.disabled = proposal.operations.length === 0 || stale || busy;
+  apply.addEventListener("click", requestApplyTerminologyProposal);
+  const discard = document.createElement("button");
+  discard.className = "secondary-button";
+  discard.textContent = "放弃草案";
+  discard.disabled = busy;
+  discard.addEventListener("click", requestDiscardTerminologyProposal);
+  actions.append(apply, discard);
+  elements.terminologyProposal.replaceChildren(title, note, list, actions);
+  renderTerminologyFindings(
+    elements.terminologyProjectedFindings,
+    "启用草案后预计新增命中",
+    state.terminologyProjectedFindings,
+    !proposal.hasScanTarget && proposal.operations.some((gate) => gate.scope !== "document")
+      ? "当前没有可用选区；章节和选区规则将在对应目标中检查。"
+      : "该草案预计不会新增违规项。",
+    {
+      proposalId: proposal.id,
+      gateRevision: proposal.baseGateRevision,
+      sourceHash: proposal.sourceHash
+    }
+  );
+}
+
+function requestApplyTerminologyProposal() {
+  const proposal = state.terminologyProposal;
+  if (!proposal || state.terminologyBusy || proposal.baseGateRevision !== state.terminologyRevision) return;
+  setTerminologyBusy("apply");
+  post("applyTerminologyProposal", {
+    proposalId: proposal.id,
+    requestId: proposal.requestId,
+    gateRevision: state.terminologyRevision
+  });
+}
+
+function requestDiscardTerminologyProposal() {
+  const proposal = state.terminologyProposal;
+  if (!proposal || state.terminologyBusy) return;
+  setTerminologyBusy("discard");
+  post("discardTerminologyProposal", {
+    proposalId: proposal.id,
+    requestId: proposal.requestId
+  });
+}
+
+function requestTerminologyScan() {
+  if (state.terminologyBusy) return;
+  const requestId = createId();
+  state.terminologyScanRequestId = requestId;
+  setTerminologyBusy("scan");
+  post("scanTerminology", { requestId });
+}
+
+function finishTerminologyBusy() {
+  state.terminologyBusy = undefined;
+  renderTerminology();
+  updateAnalyzeAvailability();
+  updateManualEditAvailability();
+  updateCollapsedDockProgress();
+}
+
 function selectedSkill() {
   return state.skills.find((skill) => `skill:${skill.id}` === state.selectedTask);
 }
@@ -3481,6 +3777,13 @@ function updateTaskUi() {
     return;
   }
   elements.taskMode.disabled = false;
+  if (state.selectedTask === "terminology") {
+    elements.analyze.textContent = state.terminologyBusy === "proposal" ? "正在生成规则草案…" : "生成规则草案";
+    elements.taskMode.disabled = Boolean(state.terminologyBusy);
+    elements.taskScopeNote.textContent = "项目级规则";
+    elements.instruction.placeholder = "例如：全文统一使用“近场动力学微分算子”，禁止“近场动力学算子”。";
+    return;
+  }
   if (!skill) {
     elements.analyze.textContent = `交给 ${state.assistantName} 分析`;
     elements.taskScopeNote.textContent = "需要 PDF 选区";
@@ -3507,6 +3810,10 @@ function updateSkills(skills) {
   revision.value = "revision";
   revision.textContent = "局部修订";
   elements.taskMode.append(revision);
+  const terminology = document.createElement("option");
+  terminology.value = "terminology";
+  terminology.textContent = "全局术语门禁";
+  elements.taskMode.append(terminology);
   for (const skill of state.skills) {
     const option = document.createElement("option");
     option.value = `skill:${skill.id}`;
@@ -3848,20 +4155,25 @@ function updateCollapsedDockProgress() {
   let percent = 0;
   let kind = "ready";
   let hasProgress = false;
+  const confirmAction = state.dockCollapsed ? pendingConfirmAction() : undefined;
 
-  if (state.compileProgressActive || !elements.compileProgress.hidden) {
+  if (state.compileProgressActive) {
     percent = state.compileProgressPercent;
     const phase = elements.compileProgressLabel.textContent?.trim() || "正在编译";
     const progressKind = elements.compileProgress.dataset.kind;
     label = `编译 · ${phase}`;
     kind = progressKind === "error" ? "error" : progressKind === "success" ? "success" : "busy";
     hasProgress = true;
-  } else if (state.dockCollapsed && state.candidateId && !elements.apply.disabled) {
-    label = "待确认修订建议 · Ctrl+Enter 应用";
+  } else if (confirmAction) {
+    label = confirmAction.label;
     kind = "warning";
-  } else if (state.dockCollapsed && state.requiresConfirmation && !state.rangeConfirmed && !elements.confirmRange.disabled) {
-    label = "待确认源码范围 · Ctrl+Enter 确认";
-    kind = "warning";
+  } else if (!elements.compileProgress.hidden) {
+    percent = state.compileProgressPercent;
+    const phase = elements.compileProgressLabel.textContent?.trim() || "编译完成";
+    const progressKind = elements.compileProgress.dataset.kind;
+    label = `编译 · ${phase}`;
+    kind = progressKind === "error" ? "error" : progressKind === "success" ? "success" : "ready";
+    hasProgress = true;
   } else if (!elements.skillProgress.hidden) {
     percent = state.skillProgressPercent;
     const name = elements.skillProgressName.textContent?.trim() || "Skill 任务";
@@ -4124,6 +4436,18 @@ elements.clearSelection.addEventListener("click", () => {
   setStatus("选区已清除。", "ready");
 });
 elements.compile.addEventListener("click", requestCompile);
+elements.terminologyButton.addEventListener("click", () => {
+  const wasCollapsed = state.dockCollapsed;
+  if (wasCollapsed) {
+    applyDockCollapsed(false);
+    updateVisiblePages();
+  }
+  elements.terminologyPanel.hidden = wasCollapsed ? false : !elements.terminologyPanel.hidden;
+  elements.terminologyButton.setAttribute("aria-expanded", String(!elements.terminologyPanel.hidden));
+  elements.terminologyButton.setAttribute("aria-label", elements.terminologyPanel.hidden ? "打开术语门禁" : "关闭术语门禁");
+  if (!elements.terminologyPanel.hidden) requestTerminologyScan();
+});
+elements.terminologyScan.addEventListener("click", requestTerminologyScan);
 elements.instruction.addEventListener("input", updateAnalyzeAvailability);
 elements.taskMode.addEventListener("change", () => {
   if (state.skillTaskRunning) return;
@@ -4265,6 +4589,14 @@ elements.analyze.addEventListener("click", () => {
     return;
   }
   if (state.pendingManualEditCount > 0) return;
+  if (state.selectedTask === "terminology") {
+    const requestId = createId();
+    state.terminologyProposalRequestId = requestId;
+    setTerminologyBusy("proposal");
+    post("proposeTerminologyGates", { requestId, instruction: elements.instruction.value });
+    setStatus("正在生成术语门禁草案……", "busy");
+    return;
+  }
   const skill = selectedSkill();
   if (skill) {
     const useSelection = skill.scope === "selection" || (skill.scope === "either" && Boolean(state.mappingId));
@@ -4316,17 +4648,35 @@ function postCandidateAction(type) {
   });
 }
 
-function confirmCollapsedDockAction() {
-  if (!state.dockCollapsed) return false;
+function pendingConfirmAction() {
+  if (state.compileProgressActive || state.busyAction === "compile" || state.pdfRefreshInProgress) {
+    return undefined;
+  }
   if (state.candidateId && state.sessionId && state.mappingId && !elements.apply.disabled) {
-    postCandidateAction("apply");
-    return true;
+    return { label: "待确认修订建议 · Ctrl+Enter 应用", run: () => postCandidateAction("apply") };
+  }
+  const proposal = state.terminologyProposal;
+  if (
+    proposal?.operations?.length && !state.terminologyBusy &&
+    proposal.baseGateRevision === state.terminologyRevision
+  ) {
+    return {
+      label: `待确认术语门禁 · ${proposal.operations.length} 条 · Ctrl+Enter 启用`,
+      run: requestApplyTerminologyProposal
+    };
   }
   if (state.requiresConfirmation && !state.rangeConfirmed && !elements.confirmRange.disabled) {
-    elements.confirmRange.click();
-    return true;
+    return { label: "待确认源码范围 · Ctrl+Enter 确认", run: () => elements.confirmRange.click() };
   }
-  return false;
+  return undefined;
+}
+
+function confirmCollapsedDockAction() {
+  if (!state.dockCollapsed) return false;
+  const action = pendingConfirmAction();
+  if (!action) return false;
+  action.run();
+  return true;
 }
 
 window.addEventListener("resize", () => {
@@ -4406,6 +4756,93 @@ window.addEventListener("message", async (event) => {
     return;
   }
   switch (message.type) {
+    case "terminologyState":
+      if (message.requestId && message.requestId !== state.terminologyScanRequestId) break;
+      if (Number.isInteger(message.stateSequence) && message.stateSequence < state.terminologyStateSequence) {
+        if (message.requestId === state.terminologyScanRequestId) {
+          state.terminologyScanRequestId = undefined;
+          finishTerminologyBusy();
+        }
+        break;
+      }
+      if (Number.isInteger(message.stateSequence)) state.terminologyStateSequence = message.stateSequence;
+      if (Number.isInteger(message.revision) && message.revision < state.terminologyRevision) break;
+      if (Number.isInteger(message.revision)) state.terminologyRevision = message.revision;
+      if (typeof message.sourceHash === "string") state.terminologySourceHash = message.sourceHash;
+      state.terminologyGates = Array.isArray(message.gates) ? message.gates : [];
+      state.terminologyFindings = Array.isArray(message.findings) ? message.findings : [];
+      if (state.terminologyBusy === "scan") {
+        state.terminologyScanRequestId = undefined;
+        finishTerminologyBusy();
+      } else {
+        renderTerminology();
+      }
+      break;
+    case "terminologyProposal":
+      if (message.requestId !== state.terminologyProposalRequestId) break;
+      if (!message.proposal || typeof message.proposal !== "object") break;
+      state.terminologyRevision = Number.isInteger(message.gateRevision) ? message.gateRevision : state.terminologyRevision;
+      if (typeof message.sourceHash === "string") state.terminologySourceHash = message.sourceHash;
+      state.terminologyProposal = {
+        ...message.proposal,
+        id: message.proposalId,
+        requestId: message.requestId,
+        baseGateRevision: Number.isInteger(message.baseGateRevision) ? message.baseGateRevision : state.terminologyRevision,
+        sourceHash: typeof message.sourceHash === "string" ? message.sourceHash : state.terminologySourceHash,
+        hasScanTarget: message.hasScanTarget === true
+      };
+      state.terminologyFindings = Array.isArray(message.currentFindings) ? message.currentFindings : state.terminologyFindings;
+      state.terminologyProjectedFindings = Array.isArray(message.projectedFindings) ? message.projectedFindings : [];
+      state.terminologyProposalRequestId = undefined;
+      state.terminologyBusy = undefined;
+      elements.terminologyPanel.hidden = false;
+      elements.terminologyButton.setAttribute("aria-expanded", String(!state.dockCollapsed));
+      elements.terminologyButton.setAttribute("aria-label", state.dockCollapsed ? "打开术语门禁" : "关闭术语门禁");
+      renderTerminology();
+      updateAnalyzeAvailability();
+      updateCollapsedDockProgress();
+      setStatus("术语门禁草案已生成，请核对后确认。", "warning");
+      break;
+    case "terminologyProposalApplied":
+      if (state.terminologyProposal && message.proposalId !== state.terminologyProposal.id) break;
+      state.terminologyProposal = undefined;
+      state.terminologyProjectedFindings = [];
+      state.terminologyLastRemoved = undefined;
+      finishTerminologyBusy();
+      setStatus(`已启用 ${message.count || 0} 条术语门禁。`, "success");
+      break;
+    case "terminologyProposalDiscarded":
+      if (state.terminologyProposal && message.proposalId !== state.terminologyProposal.id) break;
+      state.terminologyProposal = undefined;
+      state.terminologyProjectedFindings = [];
+      finishTerminologyBusy();
+      setStatus("已放弃术语门禁草案。", "ready");
+      break;
+    case "terminologyProposalInvalidated":
+      if (!state.terminologyProposal || message.proposalId === state.terminologyProposal.id) {
+        state.terminologyProposal = undefined;
+        state.terminologyProjectedFindings = [];
+        renderTerminology();
+        updateAnalyzeAvailability();
+        updateCollapsedDockProgress();
+        setStatus(
+          state.terminologyBusy === "proposal" ? "正在生成新的术语门禁草案……" : (message.message || "术语门禁草案已失效。"),
+          state.terminologyBusy === "proposal" ? "busy" : "warning"
+        );
+      }
+      break;
+    case "terminologyGateRemoved":
+      state.terminologyLastRemoved = message.gate && typeof message.gate === "object"
+        ? { ...message.gate, removedRevision: message.revision }
+        : undefined;
+      finishTerminologyBusy();
+      setStatus("术语门禁已移除，可在本面板中撤销。", "ready");
+      break;
+    case "terminologyGateRestored":
+      state.terminologyLastRemoved = undefined;
+      finishTerminologyBusy();
+      setStatus("已恢复刚才移除的术语门禁。", "success");
+      break;
     case "skillsChanged":
       updateSkills(message.skills);
       break;
@@ -4712,6 +5149,19 @@ window.addEventListener("message", async (event) => {
       setStatus(message.message, "ready");
       break;
     case "error":
+      if (message.action === "proposeTerminologyGates" && message.requestId !== state.terminologyProposalRequestId) break;
+      if ([
+        "proposeTerminologyGates",
+        "applyTerminologyProposal",
+        "discardTerminologyProposal",
+        "scanTerminology",
+        "removeTerminologyGate",
+        "undoRemoveTerminologyGate"
+      ].includes(message.action)) {
+        state.terminologyProposalRequestId = undefined;
+        state.terminologyScanRequestId = undefined;
+        finishTerminologyBusy();
+      }
       if (message.action === "locateImage" && message.requestId !== state.imageLocateRequestId) break;
       if (message.action === "queueImageEdit" && message.requestId !== state.imageQueueRequestId) break;
       if (message.action === "queueManualEdit" && message.requestId && message.requestId !== state.manualEditRequestId) break;
@@ -4774,6 +5224,18 @@ window.addEventListener("message", async (event) => {
       updateManualEditAvailability();
       setStatus(message.message, "error");
       break;
+  }
+});
+
+window.addEventListener("pagehide", () => {
+  state.pdfFetchController?.abort();
+  if (state.pdfLoadingTask) {
+    void state.pdfLoadingTask.destroy().catch(() => undefined);
+    state.pdfLoadingTask = undefined;
+  }
+  if (state.document) {
+    void state.document.destroy().catch(() => undefined);
+    state.document = undefined;
   }
 });
 

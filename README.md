@@ -8,9 +8,9 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/VS%20Code-^1.95.0-blue?logo=visualstudiocode" alt="VS Code" />
-  <img src="https://img.shields.io/badge/version-0.10.5-brightgreen" alt="版本" />
+  <img src="https://img.shields.io/badge/version-0.13.0-brightgreen" alt="版本" />
   <img src="https://img.shields.io/badge/platform-Windows-lightgrey?logo=windows" alt="Platform" />
-  <img src="https://img.shields.io/badge/license-MIT-blue" alt="License" />
+  <img src="https://img.shields.io/badge/license-project--internal-lightgrey" alt="许可证：项目内使用" />
 </p>
 
 ---
@@ -98,7 +98,7 @@
 ### 安装 / Installation
 
 ```powershell
-code --install-extension .\circletex-0.10.5.vsix --force
+code --install-extension .\circletex-0.13.0.vsix --force
 ```
 
 ### 使用 / Usage
@@ -203,8 +203,9 @@ code --install-extension .\circletex-0.10.5.vsix --force
 
 ```powershell
 npm install
-npm test        # 完整验证：编译 → 单元测试 → 烟测
-npm run package # 打包 VSIX（自动运行完整验证）
+npm test          # 快速验证：编译 → Webview 语法检查 → 单元测试
+npm run test:full # 本机完整验证：快速验证 → PDF/TeX 烟测 → Word/MathType 门禁
+npm run package   # 打包 VSIX（自动运行快速验证）
 ```
 
 按 `F5` 启动扩展开发宿主。
@@ -213,7 +214,7 @@ npm run package # 打包 VSIX（自动运行完整验证）
 
 ## 📄 许可证 / License
 
-MIT License — 详见 `LICENSE.txt`
+项目内使用许可，详见 `LICENSE.txt`。
 
 ---
 
