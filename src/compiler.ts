@@ -52,17 +52,27 @@ export class LatexCompiler {
       const seedStartedAt = Date.now();
       const auxiliarySeed = await seedAuxiliaryFiles(project.root, buildDirectory);
       logDuration(onOutput, "辅助文件预热", seedStartedAt);
-      const preflightStartedAt = Date.now();
-      reportCompileProgress(onProgress, 8, "正在运行 LaTeX 预检", true);
-      await this.runPreflight(project, onOutput);
-      logDuration(onOutput, "LaTeX 预检", preflightStartedAt);
-      reportCompileProgress(onProgress, 15, "LaTeX 预检完成");
       const locateStartedAt = Date.now();
       const xelatex = await findExecutable("xelatex");
       logDuration(onOutput, "XeLaTeX 命令定位", locateStartedAt);
       if (!xelatex) {
         throw new Error("未找到 xelatex 命令。请检查 TeX 发行版安装。");
       }
+
+      // 预检只读取源码与项目资源；与 XeLaTeX 并行执行可消除其在常规编译路径中的等待时间。
+      // 错误先被接住，避免 XeLaTeX 仍在运行时出现未处理的 Promise 拒绝；发布前会重新抛出。
+      let preflightError: unknown;
+      const preflightStartedAt = Date.now();
+      reportCompileProgress(onProgress, 8, "正在后台运行 LaTeX 预检", true);
+      const preflight = this.runPreflight(project, onOutput).then(
+        () => logDuration(onOutput, "LaTeX 预检（与 XeLaTeX 并行）", preflightStartedAt),
+        (error) => {
+          preflightError = error;
+          logDuration(onOutput, "LaTeX 预检（与 XeLaTeX 并行）", preflightStartedAt);
+        }
+      );
+      onOutput("LaTeX 预检已在后台并行执行，编译产物发布前仍会完成校验。\n");
+      reportCompileProgress(onProgress, 15, "预检已启动，正在执行 XeLaTeX");
 
       let completedPasses = 0;
       for (let index = 1; index <= passes; index += 1) {
@@ -120,6 +130,10 @@ export class LatexCompiler {
       }
       if ((await hashFile(project.tex)) !== sourceHash) {
         throw new Error("main.tex 在编译期间发生了变化，已取消发布本次 PDF。");
+      }
+      await preflight;
+      if (preflightError) {
+        throw preflightError;
       }
       const warnings = await readLatexWarnings(buildDirectory);
       const publishStartedAt = Date.now();

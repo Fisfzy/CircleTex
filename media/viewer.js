@@ -246,6 +246,8 @@ const state = {
   compileProgressActive: false,
   compileProgressPercent: 0,
   compileProgressHideTimer: undefined,
+  preserveCompileStatus: false,
+  loadingHideTimer: undefined,
   statusMessage: "请在 PDF 中划选需要修改的文字。",
   statusKind: "ready",
   cachedPreviewSignature: undefined,
@@ -339,6 +341,9 @@ function showImmediateStartupPreview() {
 
 async function loadPdf({ preservePosition = true } = {}) {
   const requestId = ++state.pdfLoadSequence;
+  if (!state.compileProgressActive) {
+    state.preserveCompileStatus = false;
+  }
   state.pdfRefreshInProgress = true;
   try {
     await loadPdfCore({ preservePosition, requestId });
@@ -436,7 +441,7 @@ async function loadPdfCore({ preservePosition = true, requestId }) {
   await nextFrame();
   ensureCurrentPdfLoad(requestId);
   restoreViewState({ ...restore, pageNumber: restorePageNumber });
-  immediateStartupPreview?.remove();
+  fadeOutAndRemove(immediateStartupPreview);
   reportPerformance("PDF 首屏页面壳体", shellsStartedAt);
   state.desiredPages = new Set([restorePageNumber]);
   const generation = state.loadGeneration;
@@ -608,6 +613,16 @@ function attachPageSnapshot(canvas, record) {
   snapshot.className = "page-refresh-snapshot";
   snapshot.append(canvas);
   record.shell.append(snapshot);
+}
+
+function fadeOutAndRemove(element) {
+  if (!element?.isConnected) return;
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+    element.remove();
+    return;
+  }
+  element.classList.add("is-fading-out");
+  setTimeout(() => element.remove(), 220);
 }
 
 function attachStartupPreview(record) {
@@ -832,7 +847,7 @@ async function renderPageRecord(record, { primary = false } = {}) {
     record.pageProxy = page;
     const viewport = page.getViewport({ scale });
     const surface = document.createElement("div");
-    surface.className = "page-surface";
+    surface.className = "page-surface is-pending";
     surface.style.width = `${viewport.width}px`;
     surface.style.height = `${viewport.height}px`;
     const canvas = document.createElement("canvas");
@@ -870,12 +885,13 @@ async function renderPageRecord(record, { primary = false } = {}) {
     record.renderedScale = scale;
     record.status = "canvas";
     record.shell.dataset.renderStage = "canvas";
-    record.shell.querySelector(":scope > .page-refresh-snapshot")?.remove();
+    surface.classList.replace("is-pending", "is-ready");
+    fadeOutAndRemove(record.shell.querySelector(":scope > .page-refresh-snapshot"));
     scheduleImageBoundaryCache(record, page, viewport, documentGeneration, renderGeneration, scale, primary);
     state.startupPreview = undefined;
     if (primary) {
       reportPerformance("PDF 首屏 Canvas", canvasStartedAt);
-      setStatus("PDF 页面已显示，正在准备文字选择……", "busy");
+      if (!state.preserveCompileStatus) setStatus("PDF 页面已显示，正在准备文字选择……", "busy");
       schedulePreviewCache(record, 120);
     }
     const textLayerStartedAt = primary ? performance.now() : 0;
@@ -895,7 +911,7 @@ async function renderPageRecord(record, { primary = false } = {}) {
       if (primary) {
         reportPerformance("PDF 首屏文字层", textLayerStartedAt);
       }
-      if (record.number === state.currentPage) setStatus("PDF 已就绪。", "ready");
+      if (record.number === state.currentPage && !state.preserveCompileStatus) setStatus("PDF 已就绪。", "ready");
     } catch (error) {
       if (isCancellation(error) || isRenderStale(record, documentGeneration, renderGeneration, scale)) return;
       record.textLayerElement?.remove();
@@ -3840,6 +3856,12 @@ function updateCollapsedDockProgress() {
     label = `编译 · ${phase}`;
     kind = progressKind === "error" ? "error" : progressKind === "success" ? "success" : "busy";
     hasProgress = true;
+  } else if (state.dockCollapsed && state.candidateId && !elements.apply.disabled) {
+    label = "待确认修订建议 · Ctrl+Enter 应用";
+    kind = "warning";
+  } else if (state.dockCollapsed && state.requiresConfirmation && !state.rangeConfirmed && !elements.confirmRange.disabled) {
+    label = "待确认源码范围 · Ctrl+Enter 确认";
+    kind = "warning";
   } else if (!elements.skillProgress.hidden) {
     percent = state.skillProgressPercent;
     const name = elements.skillProgressName.textContent?.trim() || "Skill 任务";
@@ -3867,6 +3889,7 @@ function updateCollapsedDockProgress() {
 function updateCompileProgress(message) {
   const percent = clamp(Number(message.percent), 0, 100);
   clearTimeout(state.compileProgressHideTimer);
+  state.preserveCompileStatus = false;
   state.compileProgressActive = true;
   state.compileProgressPercent = percent;
   elements.compileProgress.hidden = false;
@@ -3885,6 +3908,7 @@ function finishCompileProgress(message, kind = "success") {
   state.compileProgressActive = false;
   updateCollapsedDockProgress();
   if (kind === "success") {
+    state.preserveCompileStatus = true;
     state.compileProgressHideTimer = setTimeout(() => {
       elements.compileProgress.hidden = true;
       updateCollapsedDockProgress();
@@ -3893,6 +3917,8 @@ function finishCompileProgress(message, kind = "success") {
 }
 
 function setLoading(message, percent = 0, indeterminate = false) {
+  clearTimeout(state.loadingHideTimer);
+  elements.loading.classList.remove("is-fading-out");
   const value = clamp(percent, 0, 100);
   elements.loadingLabel.textContent = message;
   elements.loadingValue.textContent = `${Math.round(value)}%`;
@@ -3903,7 +3929,16 @@ function setLoading(message, percent = 0, indeterminate = false) {
 }
 
 function hideLoading() {
-  elements.loading.hidden = true;
+  if (elements.loading.hidden) return;
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+    elements.loading.hidden = true;
+    return;
+  }
+  elements.loading.classList.add("is-fading-out");
+  state.loadingHideTimer = setTimeout(() => {
+    elements.loading.hidden = true;
+    elements.loading.classList.remove("is-fading-out");
+  }, 160);
 }
 
 function post(type, data = {}) {
@@ -4281,6 +4316,19 @@ function postCandidateAction(type) {
   });
 }
 
+function confirmCollapsedDockAction() {
+  if (!state.dockCollapsed) return false;
+  if (state.candidateId && state.sessionId && state.mappingId && !elements.apply.disabled) {
+    postCandidateAction("apply");
+    return true;
+  }
+  if (state.requiresConfirmation && !state.rangeConfirmed && !elements.confirmRange.disabled) {
+    elements.confirmRange.click();
+    return true;
+  }
+  return false;
+}
+
 window.addEventListener("resize", () => {
   clearTimeout(state.resizeTimer);
   state.resizeTimer = setTimeout(() => {
@@ -4312,6 +4360,8 @@ window.addEventListener("keydown", (event) => {
       queueImageEditDraft();
     } else if (state.directDraft) {
       commitDirectDraft();
+    } else if (confirmCollapsedDockAction()) {
+      // 收起工具区后优先确认当前待确认事项。
     } else {
       requestCompile();
     }
